@@ -1,7 +1,7 @@
 pipeline {
 agent any
 
-```
+
 environment {
     TRUSTSTORE = "client-truststore.jks"
     TRUSTSTORE_PASS = "wso2carbon"
