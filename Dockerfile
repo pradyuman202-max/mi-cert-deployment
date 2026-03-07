@@ -4,7 +4,7 @@ USER root
 
 WORKDIR /home/wso2carbon
 
-COPY SIT_MI_Docker_Project/client-truststore.jks /home/wso2carbon/
+COPY client-truststore.jks /home/wso2carbon/
 
 RUN chown wso2carbon:root /home/wso2carbon/client-truststore.jks
 
