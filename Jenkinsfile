@@ -2,10 +2,11 @@ pipeline {
     agent any
 
     environment {
-        NAMESPACE = "mi"
-        CONFIGMAP_NAME = "mi-truststore-config"
         TRUSTSTORE = "client-truststore.jks"
-        PASSWORD = "wso2carbon"
+        TRUSTSTORE_PASS = "wso2carbon"
+        PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
+        K8S_NAMESPACE = "mi"
+        CONFIGMAP_NAME = "mi-truststore-config"
     }
 
     stages {
@@ -35,45 +36,51 @@ pipeline {
                 CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
                 if [ -z "$CERT_FILES" ]; then
-                    echo "No certificates found."
+                    echo "No certificates found"
                     exit 0
                 fi
 
                 chmod +x scripts/import-cert.sh
 
-                for cert in $CERT_FILES
+                for CERT in $CERT_FILES
                 do
-                    CERT_NAME=$(basename $cert)
-                    ALIAS=$(basename $cert | cut -d'.' -f1)
+                    CERT_NAME=$(basename $CERT)
+                    ALIAS=$(basename $CERT | cut -d. -f1)
 
                     echo "-------------------------------------"
                     echo "Processing certificate: $CERT_NAME"
                     echo "Alias: $ALIAS"
                     echo "-------------------------------------"
 
-                    ./scripts/import-cert.sh "$cert" "$TRUSTSTORE" "$PASSWORD" "$ALIAS"
+                    ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
                 done
                 '''
             }
         }
- 
-	stage('Sync Truststore to Local Project') {
-    sh '''
-    echo "Copying updated truststore to project directory..."
-    sudo cp client-truststore.jks /home/svc_account_wso2/SIT_MI_Docker_Project/
-    '''
-}
+
+        stage('Sync Truststore to Project Directory') {
+            steps {
+                sh '''
+                echo "Copying updated truststore to project directory..."
+
+                sudo cp $TRUSTSTORE $PROJECT_PATH/
+
+                echo "Verifying copied truststore:"
+                keytool -list -keystore $PROJECT_PATH/$TRUSTSTORE -storepass $TRUSTSTORE_PASS
+                '''
+            }
+        }
 
         stage('Update Kubernetes ConfigMap') {
             steps {
                 sh '''
                 echo "Updating Kubernetes ConfigMap..."
 
-                kubectl delete configmap $CONFIGMAP_NAME -n $NAMESPACE --ignore-not-found
+                kubectl delete configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE --ignore-not-found
 
                 kubectl create configmap $CONFIGMAP_NAME \
-                --from-file=$TRUSTSTORE \
-                -n $NAMESPACE
+                --from-file=$PROJECT_PATH/$TRUSTSTORE \
+                -n $K8S_NAMESPACE
                 '''
             }
         }
@@ -83,9 +90,20 @@ pipeline {
                 sh '''
                 echo "Deploying Micro Integrator with Helm..."
 
-                helm upgrade --install mi ./helm \
+                helm upgrade --install mi ./helm/ \
                 -f values.yaml \
-                -n $NAMESPACE
+                -n $K8S_NAMESPACE
+                '''
+            }
+        }
+
+        stage('Restart Deployment') {
+            steps {
+                sh '''
+                echo "Restarting MI deployment to load new truststore..."
+
+                kubectl rollout restart deployment mi-deployment -n $K8S_NAMESPACE
+                kubectl rollout status deployment mi-deployment -n $K8S_NAMESPACE
                 '''
             }
         }
@@ -94,22 +112,23 @@ pipeline {
             steps {
                 sh '''
                 echo "Checking pods..."
-                kubectl get pods -n $NAMESPACE
+
+                kubectl get pods -n $K8S_NAMESPACE
 
                 echo "Checking configmap..."
-                kubectl describe configmap $CONFIGMAP_NAME -n $NAMESPACE
+
+                kubectl describe configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE
                 '''
             }
         }
-
     }
 
     post {
         success {
-            echo "Pipeline completed successfully!"
+            echo 'Pipeline completed successfully!'
         }
         failure {
-            echo "Pipeline failed. Check logs."
+            echo 'Pipeline failed!'
         }
     }
 }
