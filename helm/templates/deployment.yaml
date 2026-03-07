@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mi-deployment
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: mi
+  template:
+    metadata:
+      labels:
+        app: mi
+    spec:
+      containers:
+      - name: wso2-mi
+        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - containerPort: {{ .Values.service.port }}
+        volumeMounts:
+        - name: truststore-volume
+          mountPath: {{ .Values.truststore.mountPath }}
+          subPath: {{ .Values.truststore.fileName }}
+      volumes:
+      - name: truststore-volume
+        configMap:
+          name: mi-truststore-config
