@@ -14,8 +14,9 @@ stages {
 
     stage('Checkout Code') {
         steps {
-            git credentialsId: 'github-ssh-key',
-            url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
+            git branch: 'main',
+                credentialsId: 'github-ssh-key',
+                url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
         }
     }
 
@@ -24,6 +25,12 @@ stages {
             sh '''
             echo "Checking repository files..."
             ls -l
+
+            echo "Checking certificate..."
+            ls -l $CERT_FILE
+
+            echo "Checking truststore..."
+            ls -l $TRUSTSTORE
             '''
         }
     }
@@ -31,7 +38,10 @@ stages {
     stage('Backup and Import Certificate') {
         steps {
             sh '''
+            echo "Preparing import script..."
             chmod +x scripts/import-cert.sh
+
+            echo "Running certificate import..."
 
             ./scripts/import-cert.sh \
             $CERT_FILE \
@@ -58,9 +68,11 @@ stages {
     stage('Deploy with Helm') {
         steps {
             sh '''
-            echo "Deploying WSO2 MI..."
+            echo "Deploying WSO2 MI via Helm..."
 
-            helm upgrade --install mi helm/ -n $NAMESPACE -f values.yaml
+            helm upgrade --install mi helm/ \
+            -n $NAMESPACE \
+            -f values.yaml
             '''
         }
     }
@@ -68,23 +80,25 @@ stages {
     stage('Verify Deployment') {
         steps {
             sh '''
-            echo "Checking rollout status..."
+            echo "Waiting for rollout..."
 
             kubectl rollout status deployment mi-deployment -n $NAMESPACE
 
-            echo "Running pods:"
+            echo "Current pods:"
             kubectl get pods -n $NAMESPACE
             '''
         }
     }
+
 }
 
 post {
     success {
-        echo "Deployment completed successfully."
+        echo "CI/CD pipeline completed successfully."
     }
+
     failure {
-        echo "Deployment failed."
+        echo "Pipeline failed. Check logs."
     }
 }
 ```
