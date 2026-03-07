@@ -7,6 +7,7 @@ pipeline {
         PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
         K8S_NAMESPACE = "mi"
         CONFIGMAP_NAME = "mi-truststore-config"
+        CERT_IMPORTED = "false"
     }
 
     stages {
@@ -30,43 +31,57 @@ pipeline {
 
         stage('Auto Import Certificates (Only New Ones)') {
             steps {
-                sh '''
-                echo "Searching for certificates..."
+                script {
+                    def newCert = sh(
+                        script: '''
+                        CERT_IMPORTED=false
 
-                CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+                        CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-                if [ -z "$CERT_FILES" ]; then
-                    echo "No certificates found"
-                    exit 0
-                fi
+                        if [ -z "$CERT_FILES" ]; then
+                            echo "No certificates found"
+                            echo "false"
+                            exit 0
+                        fi
 
-                chmod +x scripts/import-cert.sh
+                        chmod +x scripts/import-cert.sh
 
-                for CERT in $CERT_FILES
-                do
-                    CERT_NAME=$(basename $CERT)
-                    ALIAS=$(basename $CERT | cut -d. -f1)
+                        for CERT in $CERT_FILES
+                        do
+                            CERT_NAME=$(basename $CERT)
+                            ALIAS=$(basename $CERT | cut -d. -f1)
 
-                    echo "-------------------------------------"
-                    echo "Processing certificate: $CERT_NAME"
-                    echo "Alias: $ALIAS"
-                    echo "-------------------------------------"
+                            echo "-------------------------------------"
+                            echo "Processing certificate: $CERT_NAME"
+                            echo "Alias: $ALIAS"
+                            echo "-------------------------------------"
 
-                    # Check if alias already exists in truststore
-                    keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+                            keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
 
-                    if [ $? -eq 0 ]; then
-                        echo "Certificate with alias $ALIAS already exists in truststore. Skipping import."
-                    else
-                        echo "New certificate detected. Importing..."
-                        ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
-                    fi
-                done
-                '''
+                            if [ $? -eq 0 ]; then
+                                echo "Certificate $ALIAS already exists. Skipping."
+                            else
+                                echo "Importing new certificate: $ALIAS"
+                                ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                                CERT_IMPORTED=true
+                            fi
+                        done
+
+                        echo $CERT_IMPORTED
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    env.CERT_IMPORTED = newCert
+                    echo "New certificate imported: ${env.CERT_IMPORTED}"
+                }
             }
         }
 
         stage('Verify Truststore Content') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Listing truststore contents:"
@@ -76,6 +91,9 @@ pipeline {
         }
 
         stage('Sync Truststore to Project Directory') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Copying updated truststore to project directory..."
@@ -89,6 +107,9 @@ pipeline {
         }
 
         stage('Update Kubernetes ConfigMap') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Updating Kubernetes ConfigMap..."
@@ -103,6 +124,9 @@ pipeline {
         }
 
         stage('Deploy with Helm') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Deploying Micro Integrator with Helm..."
@@ -115,6 +139,9 @@ pipeline {
         }
 
         stage('Restart Deployment') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Restarting MI deployment to load new truststore..."
@@ -126,6 +153,9 @@ pipeline {
         }
 
         stage('Verify Deployment') {
+            when {
+                expression { env.CERT_IMPORTED == "true" }
+            }
             steps {
                 sh '''
                 echo "Checking pods..."
@@ -140,7 +170,13 @@ pipeline {
 
     post {
         success {
-            echo 'Pipeline completed successfully!'
+            script {
+                if (env.CERT_IMPORTED == "true") {
+                    echo "New certificate detected. Deployment completed."
+                } else {
+                    echo "No new certificates found. Skipping deployment."
+                }
+            }
         }
         failure {
             echo 'Pipeline failed!'
