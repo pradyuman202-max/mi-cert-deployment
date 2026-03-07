@@ -56,6 +56,13 @@ pipeline {
                 '''
             }
         }
+ 
+	stage('Sync Truststore to Local Project') {
+    sh '''
+    echo "Copying updated truststore to project directory..."
+    sudo cp client-truststore.jks /home/svc_account_wso2/SIT_MI_Docker_Project/
+    '''
+}
 
         stage('Update Kubernetes ConfigMap') {
             steps {
@@ -76,7 +83,7 @@ pipeline {
                 sh '''
                 echo "Deploying Micro Integrator with Helm..."
 
-                helm upgrade --install mi ./helm/ \
+                helm upgrade --install mi ./helm \
                 -f values.yaml \
                 -n $NAMESPACE
                 '''
