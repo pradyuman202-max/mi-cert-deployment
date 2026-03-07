@@ -28,7 +28,7 @@ pipeline {
             }
         }
 
-        stage('Auto Import Certificates') {
+        stage('Auto Import Certificates (Only New Ones)') {
             steps {
                 sh '''
                 echo "Searching for certificates..."
@@ -52,8 +52,25 @@ pipeline {
                     echo "Alias: $ALIAS"
                     echo "-------------------------------------"
 
-                    ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                    # Check if alias already exists in truststore
+                    keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+
+                    if [ $? -eq 0 ]; then
+                        echo "Certificate with alias $ALIAS already exists in truststore. Skipping import."
+                    else
+                        echo "New certificate detected. Importing..."
+                        ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                    fi
                 done
+                '''
+            }
+        }
+
+        stage('Verify Truststore Content') {
+            steps {
+                sh '''
+                echo "Listing truststore contents:"
+                keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
                 '''
             }
         }
@@ -112,11 +129,9 @@ pipeline {
             steps {
                 sh '''
                 echo "Checking pods..."
-
                 kubectl get pods -n $K8S_NAMESPACE
 
                 echo "Checking configmap..."
-
                 kubectl describe configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE
                 '''
             }
