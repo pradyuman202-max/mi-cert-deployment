@@ -1,69 +1,93 @@
 pipeline {
-    agent any
+agent any
 
-    environment {
-        IMAGE_NAME = "mi-local-image"
-        IMAGE_TAG  = "wso2mi_410_sit0001"
-        NAMESPACE  = "mi"
-        HELM_CHART_PATH = "helm/"
-        VALUES_FILE = "values.yaml"
-    }
+```
+environment {
+    TRUSTSTORE = "client-truststore.jks"
+    TRUSTSTORE_PASS = "wso2carbon"
+    CERT_FILE = "backend-cert.crt"
+    CERT_ALIAS = "backend-cert"
+    NAMESPACE = "mi"
+}
 
-    stages {
-        stage('Checkout Code') {
-            steps {
-                git branch: 'main',
-                    credentialsId: 'github-ssh-key',
-                    url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
-            }
-        }
+stages {
 
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    sh """
-                    docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
-                    """
-                }
-            }
-        }
-
-        stage('Push Docker Image (Optional)') {
-            steps {
-                script {
-                    // If you have private registry
-                    // sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} myregistry.com/${IMAGE_NAME}:${IMAGE_TAG}"
-                    // sh "docker push myregistry.com/${IMAGE_NAME}:${IMAGE_TAG}"
-                    echo "Skipping push for local testing"
-                }
-            }
-        }
-
-        stage('Deploy to Kubernetes with Helm') {
-            steps {
-                script {
-                    sh """
-                    helm upgrade --install mi ${HELM_CHART_PATH} -n ${NAMESPACE} -f ${VALUES_FILE}
-                    """
-                }
-            }
-        }
-
-        stage('Verify Deployment') {
-            steps {
-                script {
-                    sh "kubectl get pods -n ${NAMESPACE}"
-                }
-            }
+    stage('Checkout Code') {
+        steps {
+            git credentialsId: 'github-ssh-key',
+            url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
         }
     }
 
-    post {
-        success {
-            echo "Deployment Successful!"
+    stage('Verify Files') {
+        steps {
+            sh '''
+            echo "Checking repository files..."
+            ls -l
+            '''
         }
-        failure {
-            echo "Deployment Failed! Check logs."
+    }
+
+    stage('Backup and Import Certificate') {
+        steps {
+            sh '''
+            chmod +x scripts/import-cert.sh
+
+            ./scripts/import-cert.sh \
+            $CERT_FILE \
+            $TRUSTSTORE \
+            $TRUSTSTORE_PASS \
+            $CERT_ALIAS
+            '''
+        }
+    }
+
+    stage('Update Kubernetes ConfigMap') {
+        steps {
+            sh '''
+            echo "Updating Kubernetes ConfigMap..."
+
+            kubectl create configmap mi-truststore-config \
+            --from-file=$TRUSTSTORE \
+            -n $NAMESPACE \
+            --dry-run=client -o yaml | kubectl apply -f -
+            '''
+        }
+    }
+
+    stage('Deploy with Helm') {
+        steps {
+            sh '''
+            echo "Deploying WSO2 MI..."
+
+            helm upgrade --install mi helm/ -n $NAMESPACE -f values.yaml
+            '''
+        }
+    }
+
+    stage('Verify Deployment') {
+        steps {
+            sh '''
+            echo "Checking rollout status..."
+
+            kubectl rollout status deployment mi-deployment -n $NAMESPACE
+
+            echo "Running pods:"
+            kubectl get pods -n $NAMESPACE
+            '''
         }
     }
 }
+
+post {
+    success {
+        echo "Deployment completed successfully."
+    }
+    failure {
+        echo "Deployment failed."
+    }
+}
+```
+
+}
+
