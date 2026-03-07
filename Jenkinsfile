@@ -35,7 +35,7 @@ pipeline {
                 CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
                 if [ -z "$CERT_FILES" ]; then
-                    echo "No certificates found in repository."
+                    echo "No certificates found."
                     exit 0
                 fi
 
@@ -74,9 +74,9 @@ pipeline {
         stage('Deploy with Helm') {
             steps {
                 sh '''
-                echo "Deploying with Helm..."
+                echo "Deploying Micro Integrator with Helm..."
 
-                helm upgrade --install mi helm/mi \
+                helm upgrade --install mi ./helm/mi \
                 -f values.yaml \
                 -n $NAMESPACE
                 '''
@@ -86,14 +86,15 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh '''
-                echo "Pods status:"
+                echo "Checking pods..."
                 kubectl get pods -n $NAMESPACE
 
-                echo "ConfigMap:"
+                echo "Checking configmap..."
                 kubectl describe configmap $CONFIGMAP_NAME -n $NAMESPACE
                 '''
             }
         }
+
     }
 
     post {
