@@ -12,7 +12,9 @@ pipeline {
     stages {
         stage('Checkout Code') {
             steps {
-                git branch: 'main', url: 'https://git@github.com:pradyuman202-max/mi-cert-deployment.git'
+                git branch: 'main',
+                    credentialsId: 'github-ssh-key',
+                    url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
             }
         }
 
@@ -41,7 +43,6 @@ pipeline {
             steps {
                 script {
                     sh """
-                    # Upgrade or install Helm release
                     helm upgrade --install mi ${HELM_CHART_PATH} -n ${NAMESPACE} -f ${VALUES_FILE}
                     """
                 }
