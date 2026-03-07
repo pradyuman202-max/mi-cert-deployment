@@ -76,7 +76,7 @@ pipeline {
                 sh '''
                 echo "Deploying Micro Integrator with Helm..."
 
-                helm upgrade --install mi ./helm/mi \
+                helm upgrade --install mi ./helm/ \
                 -f values.yaml \
                 -n $NAMESPACE
                 '''
