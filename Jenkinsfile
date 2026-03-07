@@ -1,3 +1,4 @@
+```groovy
 pipeline {
     agent any
 
@@ -36,6 +37,8 @@ pipeline {
                         script: '''
                         CERT_IMPORTED=false
 
+                        echo "Searching for certificates..."
+
                         CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
                         if [ -z "$CERT_FILES" ]; then
@@ -56,12 +59,11 @@ pipeline {
                             echo "Alias: $ALIAS"
                             echo "-------------------------------------"
 
-                            keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
-
-                            if [ $? -eq 0 ]; then
-                                echo "Certificate $ALIAS already exists. Skipping."
+                            if keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+                            then
+                                echo "Certificate $ALIAS already exists in truststore. Skipping."
                             else
-                                echo "Importing new certificate: $ALIAS"
+                                echo "New certificate detected. Importing..."
                                 ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
                                 CERT_IMPORTED=true
                             fi
@@ -172,9 +174,9 @@ pipeline {
         success {
             script {
                 if (env.CERT_IMPORTED == "true") {
-                    echo "New certificate detected. Deployment completed."
+                    echo "New certificate detected. Truststore updated and deployment completed."
                 } else {
-                    echo "No new certificates found. Skipping deployment."
+                    echo "No new certificates found. Deployment skipped."
                 }
             }
         }
@@ -183,3 +185,5 @@ pipeline {
         }
     }
 }
+```
+
