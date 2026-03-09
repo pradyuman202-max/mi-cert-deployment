@@ -30,63 +30,64 @@ pipeline {
             }
         }
 
-        stage('Auto Import Certificates') {
+  	stage('Auto Import Certificates') {
             steps {
                 script {
-                    // We remove returnStdout. Instead, we write the status to cert_status.txt
-                    sh '''
-                    set +e
-                    
-                    # Initialize the status file
-                    echo "false" > cert_status.txt
+                    // Use returnStdout but redirect all noisy script output to stderr (>&2)
+                    def result = sh(
+                        script: '''
+                        set +e
+                        
+                        CERT_IMPORTED=false
 
-                    echo "Searching for certificates..."
-                    CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+                        # --- START OF NOISY BLOCK ---
+                        # Everything inside { } is redirected to standard error (>&2)
+                        # Jenkins will log it to the console, but returnStdout will ignore it!
+                        {
+                            echo "Searching for certificates..."
+                            CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-                    if [ -z "$CERT_FILES" ]; then
-                        echo "No certificate files found."
-                        exit 0
-                    fi
+                            if [ -z "$CERT_FILES" ]; then
+                                echo "No certificate files found."
+                            else
+                                chmod +x scripts/import-cert.sh
 
-                    chmod +x scripts/import-cert.sh
+                                # Create truststore if missing
+                                if [ ! -f "$TRUSTSTORE" ]; then
+                                    echo "Truststore not found. Creating new truststore..."
+                                    keytool -genkeypair -alias temp -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -keypass "$TRUSTSTORE_PASS" -dname "CN=temp" -keyalg RSA
+                                    keytool -delete -alias temp -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS"
+                                fi
 
-                    # Create truststore if missing
-                    if [ ! -f "$TRUSTSTORE" ]; then
-                        echo "Truststore not found. Creating new truststore..."
-                        keytool -genkeypair \
-                        -alias temp \
-                        -keystore $TRUSTSTORE \
-                        -storepass $TRUSTSTORE_PASS \
-                        -keypass $TRUSTSTORE_PASS \
-                        -dname "CN=temp" \
-                        -keyalg RSA
+                                for CERT in $CERT_FILES
+                                do
+                                    CERT_NAME=$(basename "$CERT")
+                                    ALIAS=$(basename "$CERT" | cut -d. -f1)
 
-                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
-                    fi
+                                    echo "Processing certificate: $CERT_NAME"
+                                    keytool -list -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -alias "$ALIAS" > /dev/null 2>&1
 
-                    for CERT in $CERT_FILES
-                    do
-                        CERT_NAME=$(basename $CERT)
-                        ALIAS=$(basename $CERT | cut -d. -f1)
+                                    if [ $? -eq 0 ]; then
+                                        echo "Certificate $ALIAS already exists in truststore."
+                                    else
+                                        echo "Importing new certificate $ALIAS"
+                                        ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
+                                        
+                                        # Mark that we successfully imported a new cert
+                                        CERT_IMPORTED=true
+                                    fi
+                                done
+                            fi
+                        } >&2 
+                        # --- END OF NOISY BLOCK ---
 
-                        echo "Processing certificate: $CERT_NAME"
+                        # This is the ONLY output captured by Groovy's returnStdout
+                        echo $CERT_IMPORTED
+                        ''',
+                        returnStdout: true
+                    ).trim()
 
-                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
-
-                        if [ $? -eq 0 ]; then
-                            echo "Certificate $ALIAS already exists in truststore."
-                        else
-                            echo "Importing new certificate $ALIAS"
-                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
-                            
-                            # Mark that we successfully imported at least one certificate
-                            echo "true" > cert_status.txt
-                        fi
-                    done
-                    '''
-
-                    // Read the clean output from the file
-                    env.CERT_IMPORTED = readFile('cert_status.txt').trim()
+                    env.CERT_IMPORTED = result
                     echo "Is a new certificate imported? ${env.CERT_IMPORTED}"
                 }
             }
