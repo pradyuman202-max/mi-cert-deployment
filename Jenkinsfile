@@ -1,4 +1,4 @@
-	def CERT_IMPORTED = "false"
+	def CERT_IMPORTED = "true"
 
 	pipeline {
 	agent any
@@ -26,6 +26,16 @@
 				sh '''
 				echo "Repository files:"
 				ls -l
+				'''
+			}
+		}
+
+		stage('CERT_IMPORTED')
+		{
+			steps {
+				sh '''
+				if [ -z "$FILES" ]; then
+					CERT_IMPORTED = "false"	
 				'''
 			}
 		}
