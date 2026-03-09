@@ -1,4 +1,4 @@
-	def CERT_IMPORTED = "false"
+	def CERT_IMPORTED = "true"
 
 	pipeline {
 	agent any
