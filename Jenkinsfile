@@ -1,196 +1,204 @@
-	def CERT_IMPORTED = "true"
+pipeline {
+agent any
 
-	pipeline {
-	agent any
+environment {
+    TRUSTSTORE = "client-truststore.jks"
+    TRUSTSTORE_PASS = "wso2carbon"
+    PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
+    K8S_NAMESPACE = "mi"
+    CONFIGMAP_NAME = "mi-truststore-config"
+    CERT_IMPORTED = "true"
+}
 
-	environment {
-		TRUSTSTORE = "client-truststore.jks"
-		TRUSTSTORE_PASS = "wso2carbon"
-		PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
-		K8S_NAMESPACE = "mi"
-		CONFIGMAP_NAME = "mi-truststore-config"
-	}
+stages {
 
-	stages {
+    stage('Checkout Code') {
+        steps {
+            git branch: 'main',
+            credentialsId: 'github-ssh-key',
+            url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
+        }
+    }
 
-		stage('Checkout Code') {
-			steps {
-				git branch: 'main',
-				credentialsId: 'github-ssh-key',
-				url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
-			}
-		}
+    stage('Verify Repo Files') {
+        steps {
+            sh '''
+            echo "Repository files:"
+            ls -l
+            '''
+        }
+    }
 
-		stage('Verify Repo Files') {
-			steps {
-				sh '''
-				echo "Repository files:"
-				ls -l
-				'''
-			}
-		}
-		
+    stage('Auto Import Certificates') {
+        steps {
+            script {
 
-		stage('Auto Import Certificates') {
-				steps {
-					script {
-						def statusCode = sh(
-							script: '''
-							set +e
-							IMPORT_STATUS=0
-							echo "Searching for new certificates..."
+                def result = sh(
+                    script: '''
+                    set +e
+                    CERT_IMPORTED=false
 
-							FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+                    echo "Searching for certificates..."
 
-							if [ -z "$FILES" ]; then
-								echo "No certificate files found in root."
-								exit 0
-							fi
+                    CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-							chmod +x scripts/import-cert.sh
+                    if [ -z "$CERT_FILES" ]; then
+                        echo "No certificate files found."
+                        echo "false"
+                        exit 0
+                    fi
 
-							for CERT in $FILES; do
-								ALIAS=$(basename "$CERT" | cut -d. -f1)
+                    chmod +x scripts/import-cert.sh
 
-								keytool -list -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -alias "$ALIAS" > /dev/null 2>&1
+                    # Create truststore if missing
+                    if [ ! -f "$TRUSTSTORE" ]; then
+                        echo "Truststore not found. Creating new truststore..."
+                        keytool -genkeypair \
+                        -alias temp \
+                        -keystore $TRUSTSTORE \
+                        -storepass $TRUSTSTORE_PASS \
+                        -keypass $TRUSTSTORE_PASS \
+                        -dname "CN=temp" \
+                        -keyalg RSA
 
-								if [ $? -ne 0 ]; then
-									echo "--- Found New Certificate: $ALIAS ---"
-									./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
-									if [ $? -eq 0 ]; then
-										IMPORT_STATUS=1
-									fi
-								else
-									echo "Certificate $ALIAS already exists. Skipping."
-								fi
-							done
+                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+                    fi
 
-							if [ $IMPORT_STATUS -eq 1 ]; then
-								exit 100
-							else
-								exit 0
-							fi
-							''',
-							returnStatus: true
-						)
+                    for CERT in $CERT_FILES
+                    do
+                        CERT_NAME=$(basename $CERT)
+                        ALIAS=$(basename $CERT | cut -d. -f1)
 
-						// 3. Update the variable without the "env." prefix
-						if (statusCode == 100) {
-							CERT_IMPORTED = "true"
-							echo "STATUS: New certificates were imported. Deployment will proceed."
-						} else {
-							CERT_IMPORTED = "false"
-							echo "STATUS: No new certificates found."
-						}
-					}
-				}
-			}
+                        echo "Processing certificate: $CERT_NAME"
 
-		stage('Verify Truststore Content') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Listing truststore contents:"
-				keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
-				'''
-			}
-		}
+                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
 
-		stage('Sync Truststore to Project Directory') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Copying updated truststore to project directory..."
+                        if [ $? -eq 0 ]; then
+                            echo "Certificate $ALIAS already exists in truststore."
+                        else
+                            echo "Importing new certificate $ALIAS"
+                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                            CERT_IMPORTED=true
+                        fi
+                    done
 
-				sudo cp $TRUSTSTORE $PROJECT_PATH/
+                    echo $CERT_IMPORTED
+                    ''',
+                    returnStdout: true
+                ).trim()
 
-				echo "Verifying copied truststore:"
-				keytool -list -keystore $PROJECT_PATH/$TRUSTSTORE -storepass $TRUSTSTORE_PASS
-				'''
-			}
-		}
+                env.CERT_IMPORTED = result
 
-		stage('Update Kubernetes ConfigMap') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Updating Kubernetes ConfigMap..."
+                echo "New certificate imported: ${env.CERT_IMPORTED}"
+            }
+        }
+    }
 
-				kubectl delete configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE --ignore-not-found
+    stage('Verify Truststore Content') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Listing truststore contents:"
+            keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+            '''
+        }
+    }
 
-				kubectl create configmap $CONFIGMAP_NAME \
-				--from-file=$PROJECT_PATH/$TRUSTSTORE \
-				-n $K8S_NAMESPACE
-				'''
-			}
-		}
+    stage('Sync Truststore to Project Directory') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Copying updated truststore to project directory..."
 
-		stage('Deploy with Helm') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Deploying Micro Integrator with Helm..."
+            sudo cp $TRUSTSTORE $PROJECT_PATH/
 
-				helm upgrade --install mi ./helm \
-				-f values.yaml \
-				-n $K8S_NAMESPACE
-				'''
-			}
-		}
+            echo "Verifying copied truststore:"
+            keytool -list -keystore $PROJECT_PATH/$TRUSTSTORE -storepass $TRUSTSTORE_PASS
+            '''
+        }
+    }
 
-		stage('Restart Deployment') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Restarting MI deployment..."
+    stage('Update Kubernetes ConfigMap') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Updating Kubernetes ConfigMap..."
 
-				kubectl rollout restart deployment mi-deployment -n $K8S_NAMESPACE
-				kubectl rollout status deployment mi-deployment -n $K8S_NAMESPACE
-				'''
-			}
-		}
+            kubectl delete configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE --ignore-not-found
 
-		stage('Verify Deployment') {
-			when {
-				expression { env.CERT_IMPORTED == "true" }
-			}
-			steps {
-				sh '''
-				echo "Checking pods..."
-				kubectl get pods -n $K8S_NAMESPACE
+            kubectl create configmap $CONFIGMAP_NAME \
+            --from-file=$PROJECT_PATH/$TRUSTSTORE \
+            -n $K8S_NAMESPACE
+            '''
+        }
+    }
 
-				echo "Checking configmap..."
-				kubectl describe configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE
-				'''
-			}
-		}
-	}
+    stage('Deploy with Helm') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Deploying Micro Integrator with Helm..."
 
-	post {
+            helm upgrade --install mi ./helm \
+            -f values.yaml \
+            -n $K8S_NAMESPACE
+            '''
+        }
+    }
 
-		success {
-			script {
-				if (env.CERT_IMPORTED == "true") {
-					echo "New certificate detected. Truststore updated and deployment completed."
-				} else {
-					echo "No new certificates found. Deployment skipped."
-				}
-			}
-		}
+    stage('Restart Deployment') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Restarting MI deployment..."
 
-		failure {
-			echo 'Pipeline failed!'
-		}
+            kubectl rollout restart deployment mi-deployment -n $K8S_NAMESPACE
+            kubectl rollout status deployment mi-deployment -n $K8S_NAMESPACE
+            '''
+        }
+    }
 
-	}
-	}
+    stage('Verify Deployment') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Checking pods..."
+            kubectl get pods -n $K8S_NAMESPACE
+
+            echo "Checking configmap..."
+            kubectl describe configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE
+            '''
+        }
+    }
+}
+
+post {
+
+    success {
+        script {
+            if (env.CERT_IMPORTED == "true") {
+                echo "New certificate detected. Truststore updated and deployment completed."
+            } else {
+                echo "No new certificates found. Deployment skipped."
+            }
+        }
+    }
+
+    failure {
+        echo 'Pipeline failed!'
+    }
+
+}
+}
