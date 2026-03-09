@@ -2,93 +2,78 @@ pipeline {
     agent any
 
     environment {
+        // Configuration
         TRUSTSTORE = "client-truststore.jks"
         TRUSTSTORE_PASS = "wso2carbon"
-        PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
-        K8S_NAMESPACE = "mi"
-        CONFIGMAP_NAME = "mi-truststore-config"
-        
-        // Start as false! We will only flip this if an import happens.
-        CERT_IMPORTED = "false" 
+        K8S_NAMESPACE = "default" // Change to your namespace
+        RELEASE_NAME = "mi-deployment"
+        CERT_IMPORTED = "false"
     }
 
     stages {
         stage('Checkout Code') {
             steps {
-                git branch: 'main',
-                    credentialsId: 'github-ssh-key',
+                git branch: 'main', 
+                    credentialsId: 'github-ssh-key', 
                     url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
             }
         }
 
-        stage('Verify Repo Files') {
-            steps {
-                sh '''
-                echo "Repository files:"
-                ls -l
-                '''
-            }
-        }
-
-  	stage('Auto Import Certificates') {
+        stage('Auto Import Certificates') {
             steps {
                 script {
-                    // Use returnStdout but redirect all noisy script output to stderr (>&2)
-                    def result = sh(
+                    // We run a shell script that exits with 100 if a change occurred
+                    def statusCode = sh(
                         script: '''
                         set +e
+                        IMPORT_STATUS=0
+                        echo "Searching for new certificates..."
                         
-                        CERT_IMPORTED=false
+                        # Find all cert files
+                        FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+                        
+                        if [ -z "$FILES" ]; then
+                            echo "No certificate files found in root."
+                            exit 0
+                        fi
 
-                        # --- START OF NOISY BLOCK ---
-                        # Everything inside { } is redirected to standard error (>&2)
-                        # Jenkins will log it to the console, but returnStdout will ignore it!
-                        {
-                            echo "Searching for certificates..."
-                            CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+                        chmod +x scripts/import-cert.sh
 
-                            if [ -z "$CERT_FILES" ]; then
-                                echo "No certificate files found."
-                            else
-                                chmod +x scripts/import-cert.sh
-
-                                # Create truststore if missing
-                                if [ ! -f "$TRUSTSTORE" ]; then
-                                    echo "Truststore not found. Creating new truststore..."
-                                    keytool -genkeypair -alias temp -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -keypass "$TRUSTSTORE_PASS" -dname "CN=temp" -keyalg RSA
-                                    keytool -delete -alias temp -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS"
+                        for CERT in $FILES; do
+                            ALIAS=$(basename "$CERT" | cut -d. -f1)
+                            
+                            # Check if alias exists in JKS
+                            keytool -list -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -alias "$ALIAS" > /dev/null 2>&1
+                            
+                            if [ $? -ne 0 ]; then
+                                echo "--- Found New Certificate: $ALIAS ---"
+                                ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
+                                if [ $? -eq 0 ]; then
+                                    IMPORT_STATUS=1
                                 fi
-
-                                for CERT in $CERT_FILES
-                                do
-                                    CERT_NAME=$(basename "$CERT")
-                                    ALIAS=$(basename "$CERT" | cut -d. -f1)
-
-                                    echo "Processing certificate: $CERT_NAME"
-                                    keytool -list -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -alias "$ALIAS" > /dev/null 2>&1
-
-                                    if [ $? -eq 0 ]; then
-                                        echo "Certificate $ALIAS already exists in truststore."
-                                    else
-                                        echo "Importing new certificate $ALIAS"
-                                        ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
-                                        
-                                        # Mark that we successfully imported a new cert
-                                        CERT_IMPORTED=true
-                                    fi
-                                done
+                            else
+                                echo "Certificate $ALIAS already exists. Skipping."
                             fi
-                        } >&2 
-                        # --- END OF NOISY BLOCK ---
+                        done
 
-                        # This is the ONLY output captured by Groovy's returnStdout
-                        echo $CERT_IMPORTED
+                        # Exit with code 100 if we actually imported something
+                        if [ $IMPORT_STATUS -eq 1 ]; then
+                            exit 100
+                        else
+                            exit 0
+                        fi
                         ''',
-                        returnStdout: true
-                    ).trim()
+                        returnStatus: true
+                    )
 
-                    env.CERT_IMPORTED = result
-                    echo "Is a new certificate imported? ${env.CERT_IMPORTED}"
+                    // Update the environment variable based on the Exit Code
+                    if (statusCode == 100) {
+                        env.CERT_IMPORTED = "true"
+                        echo "STATUS: New certificates were imported. Deployment will proceed."
+                    } else {
+                        env.CERT_IMPORTED = "false"
+                        echo "STATUS: No new certificates found. Deployment will be skipped."
+                    }
                 }
             }
         }
@@ -96,70 +81,44 @@ pipeline {
         stage('Verify Truststore Content') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Listing truststore contents:"
-                keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
-                '''
+                sh "keytool -list -keystore ${TRUSTSTORE} -storepass ${TRUSTSTORE_PASS} | grep 'trustedCertEntry' | tail -n 5"
             }
         }
 
         stage('Sync Truststore to Project Directory') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Copying updated truststore to project directory..."
-                sudo cp $TRUSTSTORE $PROJECT_PATH/
-                echo "Verifying copied truststore:"
-                keytool -list -keystore $PROJECT_PATH/$TRUSTSTORE -storepass $TRUSTSTORE_PASS
-                '''
+                sh "cp ${TRUSTSTORE} helm/mi-deployment/conf/client-truststore.jks"
             }
         }
 
         stage('Update Kubernetes ConfigMap') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Updating Kubernetes ConfigMap..."
-                kubectl delete configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE --ignore-not-found
-                kubectl create configmap $CONFIGMAP_NAME \
-                --from-file=$PROJECT_PATH/$TRUSTSTORE \
-                -n $K8S_NAMESPACE
-                '''
+                sh "kubectl create configmap mi-truststore --from-file=${TRUSTSTORE} --dry-run=client -o yaml | kubectl apply -f -"
             }
         }
 
         stage('Deploy with Helm') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Deploying Micro Integrator with Helm..."
-                helm upgrade --install mi ./helm \
-                -f values.yaml \
-                -n $K8S_NAMESPACE
-                '''
+                dir('helm') {
+                    sh "helm upgrade --install ${RELEASE_NAME} ./mi-deployment -n ${K8S_NAMESPACE}"
+                }
             }
         }
 
         stage('Restart Deployment') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Restarting MI deployment..."
-                kubectl rollout restart deployment mi-deployment -n $K8S_NAMESPACE
-                kubectl rollout status deployment mi-deployment -n $K8S_NAMESPACE
-                '''
+                sh "kubectl rollout restart deployment/${RELEASE_NAME} -n ${K8S_NAMESPACE}"
             }
         }
 
         stage('Verify Deployment') {
             when { expression { env.CERT_IMPORTED == 'true' } }
             steps {
-                sh '''
-                echo "Checking pods..."
-                kubectl get pods -n $K8S_NAMESPACE
-                echo "Checking configmap..."
-                kubectl describe configmap $CONFIGMAP_NAME -n $K8S_NAMESPACE
-                '''
+                sh "kubectl rollout status deployment/${RELEASE_NAME} -n ${K8S_NAMESPACE} --timeout=90s"
             }
         }
     }
@@ -167,15 +126,15 @@ pipeline {
     post {
         success {
             script {
-                if (env.CERT_IMPORTED == "true") {
-                    echo "New certificate detected. Truststore updated and deployment completed."
+                if (env.CERT_IMPORTED == 'true') {
+                    echo "Successfully imported certificates and redeployed the application."
                 } else {
-                    echo "No new certificates found. Deployment skipped."
+                    echo "No changes needed. Pipeline finished successfully."
                 }
             }
         }
         failure {
-            echo 'Pipeline failed!'
+            echo "Pipeline failed. Please check the logs above for errors."
         }
     }
 }
