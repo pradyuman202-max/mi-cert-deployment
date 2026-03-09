@@ -2,8 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mi-deployment
+  labels:
+    app: mi
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: 1
   selector:
     matchLabels:
       app: mi
@@ -14,14 +16,16 @@ spec:
     spec:
       containers:
       - name: wso2-mi
-        image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
-        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        image: mi-local-image:wso2mi_410_sit0001
+        imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: {{ .Values.service.port }}
+        - containerPort: 8290
+
         volumeMounts:
         - name: truststore-volume
-          mountPath: {{ .Values.truststore.mountPath }}
-          subPath: {{ .Values.truststore.fileName }}
+          mountPath: /home/wso2carbon/client-truststore.jks
+          subPath: client-truststore.jks
+
       volumes:
       - name: truststore-volume
         configMap:
