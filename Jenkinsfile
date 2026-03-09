@@ -30,7 +30,7 @@ pipeline {
             }
         }
 
-        stage('Auto Import Certificates') {
+	stage('Auto Import Certificates') {
             steps {
                 script {
                     sh '''
@@ -38,6 +38,7 @@ pipeline {
                     
                     # Clean up any flag files from previous runs
                     rm -f .cert_updated_flag
+                    rm -f import_output.log
 
                     echo "Searching for certificates..."
                     CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
@@ -63,18 +64,28 @@ pipeline {
                         keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
                     fi
 
-                    # Loop through certificates and let the bash script handle the logic
+                    # Loop through certificates
                     for CERT in $CERT_FILES
                     do
                         CERT_NAME=$(basename $CERT)
                         ALIAS=$(basename $CERT | cut -d. -f1)
 
                         echo "Processing certificate: $CERT_NAME"
-                        ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
+                        
+                        # Run the script, print output to console AND save it to a temp log file
+                        ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS" | tee import_output.log
+                        
+                        # Check if the log contains our success message
+                        if grep -q "Certificate imported successfully" import_output.log; then
+                            touch .cert_updated_flag
+                        fi
                     done
+                    
+                    # Clean up temp log
+                    rm -f import_output.log
                     '''
 
-                    // Check if the flag file was created by the bash script
+                    // Check if the flag file was created
                     def flagExists = fileExists('.cert_updated_flag')
                     
                     if (flagExists) {
@@ -86,7 +97,8 @@ pipeline {
                     echo "New certificate imported: ${env.CERT_IMPORTED}"
                 }
             }
-        }
+        }        
+
 
         stage('Verify Truststore Content') {
             when {
