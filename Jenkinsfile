@@ -4,11 +4,9 @@ pipeline {
     agent any
 
     environment {
-        // Configuration
         TRUSTSTORE = "client-truststore.jks"
         TRUSTSTORE_PASS = "wso2carbon"
         K8S_NAMESPACE = "default" 
-        // Using 'mi' as the release name based on your previous working command
         RELEASE_NAME = "mi"
     }
 
@@ -28,12 +26,9 @@ pipeline {
                         script: '''
                         set +e
                         IMPORT_STATUS=0
-                        echo "Searching for new certificates..."
-                        
                         FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
                         
                         if [ -z "$FILES" ]; then
-                            echo "No certificate files found."
                             exit 0
                         fi
 
@@ -44,49 +39,22 @@ pipeline {
                             keytool -list -keystore "$TRUSTSTORE" -storepass "$TRUSTSTORE_PASS" -alias "$ALIAS" > /dev/null 2>&1
                             
                             if [ $? -ne 0 ]; then
-                                echo "--- Found New Certificate: $ALIAS ---"
                                 ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE" "$TRUSTSTORE_PASS" "$ALIAS"
-                                if [ $? -eq 0 ]; then
-                                    IMPORT_STATUS=1
-                                fi
-                            else
-                                echo "Certificate $ALIAS already exists. Skipping."
+                                if [ $? -eq 0 ]; then IMPORT_STATUS=1; fi
                             fi
                         done
 
-                        if [ $IMPORT_STATUS -eq 1 ]; then
-                            exit 100
-                        else
-                            exit 0
-                        fi
+                        if [ $IMPORT_STATUS -eq 1 ]; then exit 100; else exit 0; fi
                         ''',
                         returnStatus: true
                     )
 
                     if (statusCode == 100) {
                         CERT_IMPORTED = "true"
-                        echo "STATUS: New certificates detected. Deployment will proceed."
                     } else {
                         CERT_IMPORTED = "false"
-                        echo "STATUS: No new certificates found."
                     }
                 }
-            }
-        }
-
-        stage('Verify Truststore Content') {
-            when { expression { return CERT_IMPORTED == 'true' } }
-            steps {
-                sh "keytool -list -keystore ${TRUSTSTORE} -storepass ${TRUSTSTORE_PASS} | grep 'trustedCertEntry' | tail -n 10"
-            }
-        }
-
-        stage('Sync Truststore to Project Directory') {
-            when { expression { return CERT_IMPORTED == 'true' } }
-            steps {
-                // We copy it into the helm folder so the chart can package it
-                sh "mkdir -p helm/conf/"
-                sh "cp ${TRUSTSTORE} helm/conf/client-truststore.jks"
             }
         }
 
@@ -97,24 +65,29 @@ pipeline {
             }
         }
 
+        stage('Cleanup Existing Service') {
+            when { expression { return CERT_IMPORTED == 'true' } }
+            steps {
+                script {
+                    // This removes the service if it exists to free up port 30290
+                    sh "kubectl delete service mi-service -n ${K8S_NAMESPACE} --ignore-not-found=true"
+                }
+            }
+        }
+
         stage('Deploy with Helm') {
             when { expression { return CERT_IMPORTED == 'true' } }
             steps {
-                // We run from the ROOT directory so we can find 'values.yaml' and the './helm' folder
                 sh '''
                 echo "Deploying Micro Integrator with Helm..."
+                # Copy truststore to where the chart expects it (based on your folder structure)
+                mkdir -p helm/conf/
+                cp ${TRUSTSTORE} helm/conf/client-truststore.jks
+                
                 helm upgrade --install ${RELEASE_NAME} ./helm \
                 -f values.yaml \
                 -n ${K8S_NAMESPACE}
                 '''
-            }
-        }
-
-        stage('Restart Deployment') {
-            when { expression { return CERT_IMPORTED == 'true' } }
-            steps {
-                // Using RELEASE_NAME variable for consistency
-                sh "kubectl rollout restart deployment/${RELEASE_NAME} -n ${K8S_NAMESPACE}"
             }
         }
 
@@ -130,14 +103,9 @@ pipeline {
         success {
             script {
                 if (CERT_IMPORTED == 'true') {
-                    echo "Successfully updated certificates and redeployed."
-                } else {
-                    echo "No changes needed. Pipeline finished successfully."
+                    echo "Successfully redeployed with new certificates."
                 }
             }
-        }
-        failure {
-            echo "Pipeline failed. Check Helm logs or Truststore paths."
         }
     }
 }
