@@ -103,7 +103,10 @@ pipeline {
             when { expression { return CERT_IMPORTED == 'true' } }
             steps {
                 dir('helm') {
-                    sh "helm upgrade --install ${RELEASE_NAME} ./mi-deployment -n ${K8S_NAMESPACE}"
+                    sh "echo "Deploying Micro Integrator with Helm..."
+				helm upgrade --install mi ./helm \
+				-f values.yaml \
+				-n $K8S_NAMESPACE"
                 }
             }
         }
