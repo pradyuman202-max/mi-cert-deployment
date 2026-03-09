@@ -7,6 +7,7 @@ environment {
     PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
     K8S_NAMESPACE = "mi"
     CONFIGMAP_NAME = "mi-truststore-config"
+    CERT_IMPORTED = "true"
 }
 
 stages {
