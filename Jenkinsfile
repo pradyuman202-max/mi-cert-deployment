@@ -33,64 +33,70 @@ stages {
         steps {
             script {
 
-                def result = sh(
-                    script: '''
-                    set +e
-                    CERT_IMPORTED=false
+    def result = sh(
+        script: '''
+        set +e
+        CERT_IMPORTED=false
 
-                    echo "Searching for certificates..."
+        echo "Checking latest git commit for new certificate files..."
 
-                    CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+        NEW_CERT_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | grep -E '\\.(crt|cer)$')
 
-                    if [ -z "$CERT_FILES" ]; then
-                        echo "No certificate files found."
-                        echo "false"
-                        exit 0
-                    fi
+        if [ -z "$NEW_CERT_FILES" ]; then
+            echo "No new certificate files detected."
+            echo "false"
+            exit 0
+        fi
 
-                    chmod +x scripts/import-cert.sh
+        echo "New certificate files detected:"
+        echo "$NEW_CERT_FILES"
 
-                    # Create truststore if missing
-                    if [ ! -f "$TRUSTSTORE" ]; then
-                        echo "Truststore not found. Creating new truststore..."
-                        keytool -genkeypair \
-                        -alias temp \
-                        -keystore $TRUSTSTORE \
-                        -storepass $TRUSTSTORE_PASS \
-                        -keypass $TRUSTSTORE_PASS \
-                        -dname "CN=temp" \
-                        -keyalg RSA
+        chmod +x scripts/import-cert.sh
 
-                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
-                    fi
+        # Create truststore if missing
+        if [ ! -f "$TRUSTSTORE" ]; then
+            echo "Truststore not found. Creating new truststore..."
 
-                    for CERT in $CERT_FILES
-                    do
-                        CERT_NAME=$(basename $CERT)
-                        ALIAS=$(basename $CERT | cut -d. -f1)
+            keytool -genkeypair \
+            -alias temp \
+            -keystore $TRUSTSTORE \
+            -storepass $TRUSTSTORE_PASS \
+            -keypass $TRUSTSTORE_PASS \
+            -dname "CN=temp" \
+            -keyalg RSA
 
-                        echo "Processing certificate: $CERT_NAME"
+            keytool -delete -alias temp \
+            -keystore $TRUSTSTORE \
+            -storepass $TRUSTSTORE_PASS
+        fi
 
-                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+        for CERT in $NEW_CERT_FILES
+        do
+            CERT_NAME=$(basename $CERT)
+            ALIAS=$(basename $CERT | cut -d. -f1)
 
-                        if [ $? -eq 0 ]; then
-                            echo "Certificate $ALIAS already exists in truststore."
-                        else
-                            echo "Importing new certificate $ALIAS"
-                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
-                            CERT_IMPORTED=true
-                        fi
-                    done
+            echo "Processing certificate: $CERT_NAME"
 
-                    echo $CERT_IMPORTED
-                    ''',
-                    returnStdout: true
-                ).trim()
+            keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
 
-                env.CERT_IMPORTED = result
+            if [ $? -eq 0 ]; then
+                echo "Certificate $ALIAS already exists in truststore."
+            else
+                echo "Importing new certificate $ALIAS"
+                ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                CERT_IMPORTED=true
+            fi
+        done
 
-                echo "New certificate imported: ${env.CERT_IMPORTED}"
-            }
+        echo $CERT_IMPORTED
+        ''',
+        returnStdout: true
+    ).trim()
+
+    env.CERT_IMPORTED = result
+
+    echo "New certificate imported: ${env.CERT_IMPORTED}"
+		}
         }
     }
 
