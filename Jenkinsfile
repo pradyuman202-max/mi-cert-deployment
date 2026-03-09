@@ -9,7 +9,7 @@
 		PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
 		K8S_NAMESPACE = "mi"
 		CONFIGMAP_NAME = "mi-truststore-config"
-		}
+	}
 
 	stages {
 
@@ -29,16 +29,7 @@
 				'''
 			}
 		}
-
-		stage('CERT_IMPORTED')
-		{
-			steps {
-				sh '''
-				if [ -z "$FILES" ]; then
-					CERT_IMPORTED = "false"	
-				'''
-			}
-		}
+		
 
 		stage('Auto Import Certificates') {
 				steps {
