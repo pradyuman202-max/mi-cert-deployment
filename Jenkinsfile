@@ -7,7 +7,7 @@ environment {
     PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
     K8S_NAMESPACE = "mi"
     CONFIGMAP_NAME = "mi-truststore-config"
-    CERT_IMPORTED = "true"
+    CERT_IMPORTED = "false"
 }
 
 stages {
@@ -36,6 +36,7 @@ stages {
                 def result = sh(
                     script: '''
                     set +e
+
                     CERT_IMPORTED=false
 
                     echo "Searching for certificates..."
@@ -53,6 +54,7 @@ stages {
                     # Create truststore if missing
                     if [ ! -f "$TRUSTSTORE" ]; then
                         echo "Truststore not found. Creating new truststore..."
+
                         keytool -genkeypair \
                         -alias temp \
                         -keystore $TRUSTSTORE \
@@ -61,7 +63,9 @@ stages {
                         -dname "CN=temp" \
                         -keyalg RSA
 
-                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+                        keytool -delete -alias temp \
+                        -keystore $TRUSTSTORE \
+                        -storepass $TRUSTSTORE_PASS
                     fi
 
                     for CERT in $CERT_FILES
@@ -71,14 +75,18 @@ stages {
 
                         echo "Processing certificate: $CERT_NAME"
 
-                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+                        ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
 
-                        if [ $? -eq 0 ]; then
-                            echo "Certificate $ALIAS already exists in truststore."
-                        else
-                            echo "Importing new certificate $ALIAS"
-                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                        EXIT_CODE=$?
+
+                        if [ $EXIT_CODE -eq 0 ]; then
+                            echo "New certificate imported: $ALIAS"
                             CERT_IMPORTED=true
+                        elif [ $EXIT_CODE -eq 2 ]; then
+                            echo "Certificate already exists: $ALIAS"
+                        else
+                            echo "Certificate import failed."
+                            exit 1
                         fi
                     done
 
