@@ -35,24 +35,46 @@ stages {
 
                 def result = sh(
                     script: '''
+                    set +e
                     CERT_IMPORTED=false
 
                     echo "Searching for certificates..."
 
                     CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
+                    if [ -z "$CERT_FILES" ]; then
+                        echo "No certificate files found."
+                        echo "false"
+                        exit 0
+                    fi
+
                     chmod +x scripts/import-cert.sh
+
+                    # Create truststore if missing
+                    if [ ! -f "$TRUSTSTORE" ]; then
+                        echo "Truststore not found. Creating new truststore..."
+                        keytool -genkeypair \
+                        -alias temp \
+                        -keystore $TRUSTSTORE \
+                        -storepass $TRUSTSTORE_PASS \
+                        -keypass $TRUSTSTORE_PASS \
+                        -dname "CN=temp" \
+                        -keyalg RSA
+
+                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+                    fi
 
                     for CERT in $CERT_FILES
                     do
                         CERT_NAME=$(basename $CERT)
                         ALIAS=$(basename $CERT | cut -d. -f1)
 
-                        echo "Processing $CERT_NAME"
+                        echo "Processing certificate: $CERT_NAME"
 
-                        if keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
-                        then
-                            echo "Certificate $ALIAS already exists"
+                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+
+                        if [ $? -eq 0 ]; then
+                            echo "Certificate $ALIAS already exists in truststore."
                         else
                             echo "Importing new certificate $ALIAS"
                             ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
@@ -60,14 +82,10 @@ stages {
                         fi
                     done
 
-                    if [ "$CERT_IMPORTED" = true ]; then
-                        echo "true"
-                    else
-                        echo "false"
-                    fi
+                    echo $CERT_IMPORTED
                     ''',
                     returnStdout: true
-                ).trim().split("\\n")[-1]
+                ).trim()
 
                 env.CERT_IMPORTED = result
 
@@ -129,7 +147,7 @@ stages {
             sh '''
             echo "Deploying Micro Integrator with Helm..."
 
-            helm upgrade --install mi ./helm/ \
+            helm upgrade --install mi ./helm \
             -f values.yaml \
             -n $K8S_NAMESPACE
             '''
@@ -167,6 +185,7 @@ stages {
 }
 
 post {
+
     success {
         script {
             if (env.CERT_IMPORTED == "true") {
@@ -176,10 +195,10 @@ post {
             }
         }
     }
+
     failure {
         echo 'Pipeline failed!'
     }
-}
 
 }
-
+}
