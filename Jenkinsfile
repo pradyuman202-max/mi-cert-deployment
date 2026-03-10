@@ -99,6 +99,7 @@ pipeline {
                     def importStatus = result.split('\n').findAll { it.startsWith('RESULT:') }
                     if (importStatus) {
                         env.CERT_IMPORTED = importStatus.last().replace('RESULT:', '')
+			env.CERT_IMPORTED = 'true'
                     } else {
                         env.CERT_IMPORTED = 'false'
                     }
