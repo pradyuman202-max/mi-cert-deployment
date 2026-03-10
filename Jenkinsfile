@@ -7,7 +7,7 @@ environment {
     PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
     K8S_NAMESPACE = "mi"
     CONFIGMAP_NAME = "mi-truststore-config"
-    CERT_IMPORTED = "false"
+    CERT_IMPORTED = "true"
 }
 
 stages {
@@ -38,20 +38,15 @@ stages {
                     set +e
                     CERT_IMPORTED=false
 
-                    echo "Checking git history for new certificate files..."
+                    echo "Searching for certificates..."
 
                     CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-                    NEW_CERT_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E "\\.(crt|cer)$"))
-
-                    if [ -z "$NEW_CERT_FILES" ]; then
-                        echo "No new certificate files detected in git commit."
+                    if [ -z "$CERT_FILES" ]; then
+                        echo "No certificate files found."
                         echo "false"
                         exit 0
                     fi
-
-                    echo "New certificate files detected:"
-                    echo "$NEW_CERT_FILES"
 
                     chmod +x scripts/import-cert.sh
 
@@ -99,7 +94,7 @@ stages {
         }
     }
 
-	stage('Organize Certificates') {
+    	stage('Organize Certificates') {
     when {
         expression { env.CERT_IMPORTED == "true" }
     }
@@ -123,7 +118,7 @@ stages {
         find $PROJECT_DIR -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\)
         '''
     }
-}    
+}
 
 	stage('Verify Truststore Content') {
         when {
