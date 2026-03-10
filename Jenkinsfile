@@ -7,6 +7,7 @@ environment {
     PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
     K8S_NAMESPACE = "mi"
     CONFIGMAP_NAME = "mi-truststore-config"
+    CERT_IMPORTED = "false"
 }
 
 stages {
@@ -32,70 +33,69 @@ stages {
         steps {
             script {
 
-    def result = sh(
-        script: '''
-        set +e
-        CERT_IMPORTED=false
+                def result = sh(
+                    script: '''
+                    set +e
+                    CERT_IMPORTED=false
 
-        echo "Checking latest git commit for new certificate files..."
+                    echo "Checking git history for new certificate files..."
 
-        NEW_CERT_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | grep -E '\\.(crt|cer)$')
+                    CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-        if [ -z "$NEW_CERT_FILES" ]; then
-            echo "No new certificate files detected."
-            echo "false"
-            exit 0
-        fi
+                    NEW_CERT_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E '\.(crt|cer)$')
 
-        echo "New certificate files detected:"
-        echo "$NEW_CERT_FILES"
+                    if [ -z "$NEW_CERT_FILES" ]; then
+                        echo "No new certificate files detected in git commit."
+                        echo "false"
+                        exit 0
+                    fi
 
-        chmod +x scripts/import-cert.sh
+                    echo "New certificate files detected:"
+                    echo "$NEW_CERT_FILES"
 
-        # Create truststore if missing
-        if [ ! -f "$TRUSTSTORE" ]; then
-            echo "Truststore not found. Creating new truststore..."
+                    chmod +x scripts/import-cert.sh
 
-            keytool -genkeypair \
-            -alias temp \
-            -keystore $TRUSTSTORE \
-            -storepass $TRUSTSTORE_PASS \
-            -keypass $TRUSTSTORE_PASS \
-            -dname "CN=temp" \
-            -keyalg RSA
+                    # Create truststore if missing
+                    if [ ! -f "$TRUSTSTORE" ]; then
+                        echo "Truststore not found. Creating new truststore..."
+                        keytool -genkeypair \
+                        -alias temp \
+                        -keystore $TRUSTSTORE \
+                        -storepass $TRUSTSTORE_PASS \
+                        -keypass $TRUSTSTORE_PASS \
+                        -dname "CN=temp" \
+                        -keyalg RSA
 
-            keytool -delete -alias temp \
-            -keystore $TRUSTSTORE \
-            -storepass $TRUSTSTORE_PASS
-        fi
+                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+                    fi
 
-        for CERT in $NEW_CERT_FILES
-        do
-            CERT_NAME=$(basename $CERT)
-            ALIAS=$(basename $CERT | cut -d. -f1)
+                    for CERT in $CERT_FILES
+                    do
+                        CERT_NAME=$(basename $CERT)
+                        ALIAS=$(basename $CERT | cut -d. -f1)
 
-            echo "Processing certificate: $CERT_NAME"
+                        echo "Processing certificate: $CERT_NAME"
 
-            keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
+                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
 
-            if [ $? -eq 0 ]; then
-                echo "Certificate $ALIAS already exists in truststore."
-            else
-                echo "Importing new certificate $ALIAS"
-                ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
-                CERT_IMPORTED=true
-            fi
-        done
+                        if [ $? -eq 0 ]; then
+                            echo "Certificate $ALIAS already exists in truststore."
+                        else
+                            echo "Importing new certificate $ALIAS"
+                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+                            CERT_IMPORTED=true
+                        fi
+                    done
 
-        echo $CERT_IMPORTED
-        ''',
-        returnStdout: true
-    ).trim()
+                    echo $CERT_IMPORTED
+                    ''',
+                    returnStdout: true
+                ).trim()
 
-    env.CERT_IMPORTED = result
+                env.CERT_IMPORTED = result
 
-    echo "New certificate imported: ${env.CERT_IMPORTED}"
-		}
+                echo "New certificate imported: ${env.CERT_IMPORTED}"
+            }
         }
     }
 
@@ -123,10 +123,9 @@ stages {
         find $PROJECT_DIR -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\)
         '''
     }
-}
-		
- 
-  stage('Verify Truststore Content') {
+}    
+
+	stage('Verify Truststore Content') {
         when {
             expression { env.CERT_IMPORTED == "true" }
         }
