@@ -100,6 +100,37 @@ stages {
         }
     }
 
+	
+	stage('Archive Imported Certificates') {
+    when {
+        expression { env.CERT_IMPORTED == "true" }
+    }
+    steps {
+        sh '''
+        echo "Moving imported certificates to central certificate store..."
+
+        CERT_DEST="/home/svc_account_wso2/SIT_MI_Docker_Project/certificates"
+
+        mkdir -p $CERT_DEST
+
+        CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
+
+        for CERT in $CERT_FILES
+        do
+            CERT_NAME=$(basename $CERT)
+
+            echo "Moving $CERT_NAME to certificate store..."
+
+            mv $CERT $CERT_DEST/
+        done
+
+        echo "Certificates now stored in:"
+        ls -l $CERT_DEST
+        '''
+    }
+}
+	
+
     stage('Verify Truststore Content') {
         when {
             expression { env.CERT_IMPORTED == "true" }
