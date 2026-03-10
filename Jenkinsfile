@@ -42,7 +42,7 @@ stages {
 
                     CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
-                    NEW_CERT_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E '\.(crt|cer)$')
+                    NEW_CERT_FILES=$(git diff --name-only HEAD~1 HEAD | grep -E "\\.(crt|cer)$"))
 
                     if [ -z "$NEW_CERT_FILES" ]; then
                         echo "No new certificate files detected in git commit."
