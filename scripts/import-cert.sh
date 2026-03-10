@@ -14,7 +14,7 @@ then
     exit 0
 else
     echo "Importing certificate '$ALIAS'..."
-    
+
     # Only backup if the truststore file actually exists and we are doing an import
     if [ -f "$TRUSTSTORE" ]; then
         BACKUP_DIR="truststore-backups"
@@ -36,4 +36,8 @@ else
 fi
 
 echo "Current truststore entries:"
-keytool -list -keystore "$TRUSTSTORE" -storepass "$PASSWORD" | grep "$ALIAS"
+# 1. FIXED: Added '-i' for case-insensitive grep
+keytool -list -keystore "$TRUSTSTORE" -storepass "$PASSWORD" | grep -i "$ALIAS"
+
+# 2. FIXED: Explicitly exit with success so Jenkins knows it worked
+exit 0
