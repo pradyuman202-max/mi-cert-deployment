@@ -7,7 +7,7 @@ environment {
     PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
     K8S_NAMESPACE = "mi"
     CONFIGMAP_NAME = "mi-truststore-config"
-    CERT_IMPORTED = "true"
+    CERT_IMPORTED = "false"
 }
 
 stages {
@@ -29,98 +29,95 @@ stages {
         }
     }
 
-    stage('Auto Import Certificates') {
+    stage('Check New Certificate') {
         steps {
             script {
 
-                def result = sh(
+                def certCheck = sh(
                     script: '''
-                    set +e
-                    CERT_IMPORTED=false
-
-                    echo "Searching for certificates..."
-
-                    CERT_FILES=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\))
-
-                    if [ -z "$CERT_FILES" ]; then
-                        echo "No certificate files found."
-                        echo "false"
-                        exit 0
-                    fi
-
-                    chmod +x scripts/import-cert.sh
-
-                    # Create truststore if missing
-                    if [ ! -f "$TRUSTSTORE" ]; then
-                        echo "Truststore not found. Creating new truststore..."
-                        keytool -genkeypair \
-                        -alias temp \
-                        -keystore $TRUSTSTORE \
-                        -storepass $TRUSTSTORE_PASS \
-                        -keypass $TRUSTSTORE_PASS \
-                        -dname "CN=temp" \
-                        -keyalg RSA
-
-                        keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
-                    fi
-
-                    for CERT in $CERT_FILES
-                    do
-                        CERT_NAME=$(basename $CERT)
-                        ALIAS=$(basename $CERT | cut -d. -f1)
-
-                        echo "Processing certificate: $CERT_NAME"
-
-                        keytool -list -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS -alias $ALIAS > /dev/null 2>&1
-
-                        if [ $? -eq 0 ]; then
-                            echo "Certificate $ALIAS already exists in truststore."
-                        else
-                            echo "Importing new certificate $ALIAS"
-                            ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
-                            CERT_IMPORTED=true
-                        fi
-                    done
-
-                    echo $CERT_IMPORTED
+                    chmod +x scripts/this_cert_check.sh
+                    scripts/this_cert_check.sh
                     ''',
-                    returnStdout: true
-                ).trim()
+                    returnStatus: true
+                )
 
-                env.CERT_IMPORTED = result
-
-                echo "New certificate imported: ${env.CERT_IMPORTED}"
+                if (certCheck == 0) {
+                    echo "Certificate detected. Continuing pipeline."
+                    env.CERT_IMPORTED = "true"
+                } else {
+                    echo "No certificate detected. Remaining stages will be skipped."
+                    env.CERT_IMPORTED = "false"
+                }
             }
         }
     }
 
-        stage('Organize Certificates') {
-    when {
-        expression { env.CERT_IMPORTED == "true" }
+    stage('Auto Import Certificates') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Importing certificates..."
+
+            CERT_DIR="/home/svc_account_wso2/SIT_MI"
+
+            CERT_FILES=$(find "$CERT_DIR" -type f \\( -name "*.crt" -o -name "*.cer" \\))
+
+            chmod +x scripts/import-cert.sh
+
+            # Create truststore if missing
+            if [ ! -f "$TRUSTSTORE" ]; then
+                echo "Truststore not found. Creating new truststore..."
+
+                keytool -genkeypair \
+                -alias temp \
+                -keystore $TRUSTSTORE \
+                -storepass $TRUSTSTORE_PASS \
+                -keypass $TRUSTSTORE_PASS \
+                -dname "CN=temp" \
+                -keyalg RSA
+
+                keytool -delete -alias temp -keystore $TRUSTSTORE -storepass $TRUSTSTORE_PASS
+            fi
+
+            for CERT in $CERT_FILES
+            do
+                CERT_NAME=$(basename $CERT)
+                ALIAS=$(basename $CERT | cut -d. -f1)
+
+                echo "Importing certificate: $CERT_NAME"
+
+                ./scripts/import-cert.sh $CERT $TRUSTSTORE $TRUSTSTORE_PASS $ALIAS
+            done
+            '''
+        }
     }
-    steps {
-        sh '''
-        echo "Organizing certificates into central directory..."
 
-        CERT_DEST="/home/svc_account_wso2/SIT_MI_Docker_Project/certificates"
-        PROJECT_DIR="/home/svc_account_wso2/SIT_MI_Docker_Project"
+    stage('Organize Certificates') {
+        when {
+            expression { env.CERT_IMPORTED == "true" }
+        }
+        steps {
+            sh '''
+            echo "Organizing certificates into central directory..."
 
-        mkdir -p $CERT_DEST
+            CERT_DEST="/home/svc_account_wso2/SIT_MI_Docker_Project/certificates"
+            PROJECT_DIR="/home/svc_account_wso2/SIT_MI_Docker_Project"
 
-        echo "Moving all certificate files from project root..."
+            mkdir -p $CERT_DEST
 
-        find $PROJECT_DIR -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) -exec mv -f {} $CERT_DEST/ \\;
+            echo "Moving certificates..."
 
-        echo "Current certificate directory content:"
-        ls -l $CERT_DEST
+            find $PROJECT_DIR -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) -exec mv -f {} $CERT_DEST/ \\;
 
-        echo "Checking project root for remaining certificates..."
-        find $PROJECT_DIR -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\)
-        '''
+            echo "Current certificate directory content:"
+            ls -l $CERT_DEST
+            '''
+        }
     }
-}
 
-        stage('Verify Truststore Content') {
+    stage('Verify Truststore Content') {
         when {
             expression { env.CERT_IMPORTED == "true" }
         }
@@ -208,6 +205,7 @@ stages {
             '''
         }
     }
+
 }
 
 post {
@@ -215,9 +213,9 @@ post {
     success {
         script {
             if (env.CERT_IMPORTED == "true") {
-                echo "New certificate detected. Truststore updated and deployment completed."
+                echo "Certificate detected. Truststore updated and deployment completed."
             } else {
-                echo "No new certificates found. Deployment skipped."
+                echo "No certificate found. Deployment skipped."
             }
         }
     }
