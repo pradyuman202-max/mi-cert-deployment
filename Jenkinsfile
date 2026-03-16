@@ -60,7 +60,7 @@ stages {
             sh '''
             echo "Importing certificates..."
 
-            CERT_DIR="/home/svc_account_wso2/SIT_MI"
+            CERT_DIR="/home/svc_account_wso2/SIT_MI_Docker_Project"
 
             CERT_FILES=$(find "$CERT_DIR" -type f \\( -name "*.crt" -o -name "*.cer" \\))
 
