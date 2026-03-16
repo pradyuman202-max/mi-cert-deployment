@@ -76,29 +76,6 @@ pipeline {
             }
         }
 
-        stage('Organize Certificates') {
-            steps {
-                script {
-                    def certCheck = sh(
-                        script: 'scripts/this_cert_check.sh',
-                        returnStatus: true
-                    )
-
-                    if (certCheck != 0) {
-                        echo "No certificate detected. Skipping stage."
-                        return
-                    }
-
-                    sh '''
-                    echo "Organizing certificates..."
-                    CERT_DEST="$PROJECT_PATH/certificates"
-                    mkdir -p $CERT_DEST
-                    find $PROJECT_PATH -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) -exec mv -f {} $CERT_DEST/ \\;
-                    ls -l $CERT_DEST
-                    '''
-                }
-            }
-        }
 
         stage('Verify Truststore Content') {
             steps {
@@ -236,6 +213,30 @@ pipeline {
             }
         }
     }
+
+        stage('Organize Certificates') {
+            steps {
+                script {
+                    def certCheck = sh(
+                        script: 'scripts/this_cert_check.sh',
+                        returnStatus: true
+                    )
+
+                    if (certCheck != 0) {
+                        echo "No certificate detected. Skipping stage."
+                        return
+                    }
+
+                    sh '''
+                    echo "Organizing certificates..."
+                    CERT_DEST="$PROJECT_PATH/certificates"
+                    mkdir -p $CERT_DEST
+                    find $PROJECT_PATH -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) -exec mv -f {} $CERT_DEST/ \\;
+                    ls -l $CERT_DEST
+                    '''
+                }
+            }
+        }
 
     post {
         success {
