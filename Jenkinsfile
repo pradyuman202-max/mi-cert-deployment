@@ -76,7 +76,6 @@ pipeline {
             }
         }
 
-
         stage('Verify Truststore Content') {
             steps {
                 script {
@@ -212,7 +211,6 @@ pipeline {
                 }
             }
         }
-    }
 
         stage('Organize Certificates') {
             steps {
@@ -237,6 +235,7 @@ pipeline {
                 }
             }
         }
+    }
 
     post {
         success {
