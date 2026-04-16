@@ -1,0 +1,256 @@
+pipeline {
+    agent any
+
+    environment {
+        // --- Project ---
+        PROJECT_NAME        = "HelloWorld"
+        CAPP_NAME           = "HelloWorldCompositeExporter"
+        CAPP_VERSION        = "1.0.0-SNAPSHOT"
+
+        // --- Paths ---
+        DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
+        CAPP_SOURCE_PATH    = "${DOCKER_PROJECT_PATH}/HelloWorld"
+        CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
+
+        // --- Docker / Registry ---
+        REGISTRY            = "localhost:5000"
+        IMAGE_NAME          = "mi-sit"
+        IMAGE_TAG           = "capp-${BUILD_NUMBER}"
+        FULL_IMAGE          = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+        // --- Kubernetes ---
+        K8S_NAMESPACE       = "mi"
+        HELM_RELEASE        = "mi"
+        HELM_CHART_PATH     = "${DOCKER_PROJECT_PATH}/helm"
+        VALUES_FILE         = "${DOCKER_PROJECT_PATH}/values-dev.yaml"
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────
+        // 1. Checkout
+        // ─────────────────────────────────────────────
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-ssh-key',
+                    url: 'git@github.com:pradyuman202-max/HelloWorld.git'
+            }
+        }
+
+        stage('Verify Repo Files') {
+            steps {
+                sh '''
+                echo "=== Workspace files ==="
+                ls -l
+                echo "=== Maven project structure ==="
+                find . -name "pom.xml" | head -20
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 2. Build CApp via Maven
+        // ─────────────────────────────────────────────
+        stage('Maven Build') {
+            steps {
+                sh '''
+                echo "=== Building CApp with Maven ==="
+                mvn clean deploy \
+                    -Dmaven.test.skip=false \
+                    --batch-mode \
+                    --no-transfer-progress
+                '''
+            }
+        }
+
+        stage('Verify CApp Artifact') {
+            steps {
+                sh '''
+                echo "=== Looking for .car file ==="
+                find . -name "*.car" -type f
+
+                CAR_FILE=$(find . -name "${CAPP_NAME}-${CAPP_VERSION}.car" -type f | head -1)
+
+                if [ -z "$CAR_FILE" ]; then
+                    echo "ERROR: .car file not found! Check Maven build output."
+                    exit 1
+                fi
+
+                echo "Found CApp: $CAR_FILE"
+                ls -lh "$CAR_FILE"
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 3. Prepare Docker context
+        // ─────────────────────────────────────────────
+        stage('Copy CApp to Docker Context') {
+            steps {
+                sh '''
+                echo "=== Copying .car to Docker build context ==="
+                mkdir -p ${CAPP_DEST_DIR}
+
+                CAR_FILE=$(find . -name "${CAPP_NAME}-${CAPP_VERSION}.car" -type f | head -1)
+                cp "$CAR_FILE" ${CAPP_DEST_DIR}/
+
+                echo "=== Contents of capps/ directory ==="
+                ls -lh ${CAPP_DEST_DIR}/
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 4. Docker build + push to local registry
+        // ─────────────────────────────────────────────
+        stage('Docker Build') {
+            steps {
+                sh '''
+                echo "=== Building Docker image: ${FULL_IMAGE} ==="
+                cd ${DOCKER_PROJECT_PATH}
+                docker build \
+                    --no-cache \
+                    -t ${FULL_IMAGE} \
+                    -t ${REGISTRY}/${IMAGE_NAME}:latest \
+                    .
+                echo "=== Image built successfully ==="
+                docker images | grep ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Docker Push to Local Registry') {
+            steps {
+                sh '''
+                echo "=== Pushing image to local registry ==="
+
+                # Verify local registry is up
+                if ! curl -sf http://${REGISTRY}/v2/_catalog > /dev/null; then
+                    echo "ERROR: Local registry at ${REGISTRY} is not reachable."
+                    echo "Start it with: docker run -d -p 5000:5000 --name registry registry:2"
+                    exit 1
+                fi
+
+                docker push ${FULL_IMAGE}
+                docker push ${REGISTRY}/${IMAGE_NAME}:latest
+
+                echo "=== Push complete ==="
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 5. Update values-dev.yaml with new image tag
+        // ─────────────────────────────────────────────
+        stage('Update values-dev.yaml') {
+            steps {
+                sh '''
+                echo "=== Updating image tag in values-dev.yaml ==="
+
+                # Update repository and tag inline using sed
+                sed -i "s|repository:.*|repository: ${REGISTRY}/${IMAGE_NAME}|" ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|" ${VALUES_FILE}
+                sed -i "s|pullPolicy:.*|pullPolicy: Always|" ${VALUES_FILE}
+
+                echo "=== Updated image section in values-dev.yaml ==="
+                grep -A 3 "^image:" ${VALUES_FILE}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 6. Deploy via Helm
+        // ─────────────────────────────────────────────
+        stage('Helm Deploy (Dev)') {
+            steps {
+                sh '''
+                echo "=== Deploying to Kubernetes namespace: ${K8S_NAMESPACE} ==="
+                helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
+                    -f ${VALUES_FILE} \
+                    -n ${K8S_NAMESPACE} \
+                    --wait \
+                    --timeout 3m0s
+
+                echo "=== Helm release status ==="
+                helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 7. Verify
+        // ─────────────────────────────────────────────
+        stage('Verify Rollout') {
+            steps {
+                sh '''
+                echo "=== Waiting for rollout to complete ==="
+                kubectl rollout status deployment/mi-deployment \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=120s
+
+                echo "=== Pod status ==="
+                kubectl get pods -n ${K8S_NAMESPACE} -o wide
+
+                echo "=== Image running in pod ==="
+                kubectl get pods -n ${K8S_NAMESPACE} \
+                    -o jsonpath="{.items[*].spec.containers[*].image}" \
+                    | tr ' ' '\n'
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                sh '''
+                echo "=== Waiting for MI to be ready ==="
+                sleep 15
+
+                POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
+                    -l app.kubernetes.io/instance=${HELM_RELEASE} \
+                    -o jsonpath="{.items[0].metadata.name}")
+
+                echo "Checking pod: $POD"
+
+                kubectl exec $POD -n ${K8S_NAMESPACE} -- \
+                    curl -sf http://localhost:9164/healthz \
+                    && echo "Health check PASSED" \
+                    || echo "Health check endpoint not available — check MI management port"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+            ╔══════════════════════════════════════════╗
+            ║   CApp Deployment SUCCESS                ║
+            ║   Image : ${FULL_IMAGE}
+            ║   Namespace : ${K8S_NAMESPACE}
+            ╚══════════════════════════════════════════╝
+            """
+        }
+        failure {
+            sh '''
+            echo "=== FAILURE: Last pod events ==="
+            kubectl describe pods -n ${K8S_NAMESPACE} \
+                -l app.kubernetes.io/instance=${HELM_RELEASE} \
+                | tail -30 || true
+            '''
+            echo "Pipeline FAILED. Check logs above."
+        }
+        cleanup {
+            sh '''
+            echo "=== Cleaning up local Docker images older than 3 builds ==="
+            docker images ${REGISTRY}/${IMAGE_NAME} \
+                --format "{{.Tag}}" \
+                | grep "^capp-" \
+                | sort -t- -k2 -n \
+                | head -n -3 \
+                | xargs -I{} docker rmi ${REGISTRY}/${IMAGE_NAME}:{} || true
+            '''
+        }
+    }
+}
+

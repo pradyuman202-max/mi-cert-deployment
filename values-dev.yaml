@@ -1,0 +1,36 @@
+# ── Dev Environment Values ───────────────────────────────────────────────────
+# This file is auto-updated by the Jenkins pipeline (image.tag field).
+# Do NOT manually hardcode the tag here — it is managed by CI/CD.
+# ─────────────────────────────────────────────────────────────────────────────
+
+replicaCount: 1
+
+image:
+  repository: localhost:5000/mi-sit   # Updated by Jenkins: sed on image.repository
+  tag: latest                          # Updated by Jenkins: sed on image.tag
+  pullPolicy: Always                   # Must be Always so K8s pulls new tag each deploy
+
+service:
+  type: NodePort
+  port: 8290
+  nodePort: 30290
+
+management:
+  port: 9164
+
+truststore:
+  mountPath: /home/wso2carbon/security
+  fileName: client-truststore.jks
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "500m"
+  limits:
+    memory: "1Gi"
+    cpu: "1"
+
+# ── Dev-specific overrides ────────────────────────────────────────────────────
+env: dev
+debug: true
+
