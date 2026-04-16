@@ -10,11 +10,14 @@ pipeline {
         DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
         CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
 
-        // --- Docker / Registry ---
-        REGISTRY            = "localhost:5000"
+        // --- Docker ---
+        // No registry push needed — image loaded directly into kind
         IMAGE_NAME          = "mi-sit"
-        IMAGE_TAG           = "capp-${BUILD_NUMBER}"
-        FULL_IMAGE          = "${REGISTRY}/${IMAGE_NAME}:capp-${BUILD_NUMBER}"
+        IMAGE_TAG           = "sit${BUILD_NUMBER.padLeft(4, '0')}"
+        FULL_IMAGE          = "${IMAGE_NAME}:${IMAGE_TAG}"
+
+        // --- Kind cluster name (from: kubectl get nodes) ---
+        KIND_CLUSTER        = "wso2-cluster"
 
         // --- Kubernetes ---
         K8S_NAMESPACE       = "mi"
@@ -76,7 +79,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Docker build + push
+        // 3. Docker build
         // ─────────────────────────────────────────────
         stage('Docker Build') {
             steps {
@@ -87,7 +90,6 @@ pipeline {
                 docker build \
                     --no-cache \
                     -t ${FULL_IMAGE} \
-                    -t ${REGISTRY}/${IMAGE_NAME}:latest \
                     .
 
                 echo "=== Image built successfully ==="
@@ -96,50 +98,47 @@ pipeline {
             }
         }
 
-        stage('Docker Push to Local Registry') {
+        // ─────────────────────────────────────────────
+        // 4. Load image directly into kind cluster
+        //    (avoids localhost:5000 registry pull issue)
+        // ─────────────────────────────────────────────
+        stage('Load Image into Kind') {
             steps {
                 sh '''
-                echo "=== Verifying local registry is reachable ==="
-                if ! curl -sf http://${REGISTRY}/v2/_catalog > /dev/null; then
-                    echo "ERROR: Local registry at ${REGISTRY} is not reachable."
-                    echo "Run: docker run -d -p 5000:5000 --name local-registry registry:2"
-                    exit 1
-                fi
+                echo "=== Loading ${FULL_IMAGE} into kind cluster: ${KIND_CLUSTER} ==="
+                kind load docker-image ${FULL_IMAGE} --name ${KIND_CLUSTER}
 
-                echo "=== Pushing ${FULL_IMAGE} ==="
-                docker push ${FULL_IMAGE}
-
-                echo "=== Pushing latest tag ==="
-                docker push ${REGISTRY}/${IMAGE_NAME}:latest
-
-                echo "=== Registry contents after push ==="
-                curl -s http://${REGISTRY}/v2/_catalog
-                echo ""
-                echo "=== Push complete ==="
+                echo "=== Verifying image loaded into kind ==="
+                docker exec ${KIND_CLUSTER}-control-plane crictl images | grep ${IMAGE_NAME}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 4. Update values-dev.yaml image tag
+        // 5. Update values-dev.yaml
+        //    Tag format: sit0001, sit0002 ... easy rollback
+        //    To rollback: change tag to sit0005 → helm upgrade
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
             steps {
                 sh '''
                 echo "=== Updating image section in values-dev.yaml ==="
 
-                sed -i "s|repository:.*|repository: ${REGISTRY}/${IMAGE_NAME}|" ${VALUES_FILE}
-                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                            ${VALUES_FILE}
-                sed -i "s|pullPolicy:.*|pullPolicy: Always|"                    ${VALUES_FILE}
+                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"   ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                  ${VALUES_FILE}
+                # IfNotPresent — image already loaded into kind, no pull needed
+                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"     ${VALUES_FILE}
 
                 echo "=== Current image section ==="
                 grep -A 3 "^image:" ${VALUES_FILE}
+                echo ""
+                echo "=== To rollback: change tag to previous sit#### and run helm upgrade ==="
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 5. Helm deploy + force pod restart
+        // 6. Helm deploy + force pod restart
         // ─────────────────────────────────────────────
         stage('Helm Deploy (Dev)') {
             steps {
@@ -150,10 +149,10 @@ pipeline {
                     -n ${K8S_NAMESPACE} \
                     --timeout 3m0s
 
-                echo "=== Forcing pod restart to pull new image ==="
+                echo "=== Forcing pod restart to use new image ==="
                 kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
 
-                echo "=== Waiting for rollout to complete ==="
+                echo "=== Waiting for rollout ==="
                 kubectl rollout status deployment/mi-deployment \
                     -n ${K8S_NAMESPACE} \
                     --timeout=120s
@@ -165,7 +164,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 6. Verify
+        // 7. Verify
         // ─────────────────────────────────────────────
         stage('Verify Rollout') {
             steps {
@@ -187,7 +186,6 @@ pipeline {
                 echo "=== Waiting 15s for MI to initialize ==="
                 sleep 15
 
-                # Fixed label: app=mi (matches actual pod labels)
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
                     -l app=mi \
                     -o jsonpath="{.items[0].metadata.name}")
@@ -211,6 +209,9 @@ pipeline {
             ║  CApp    : ${CAR_FILE}
             ║  Image   : ${FULL_IMAGE}
             ║  NS      : ${K8S_NAMESPACE}
+            ║
+            ║  ROLLBACK: set tag to previous sit####
+            ║  in values-dev.yaml → helm upgrade
             ╚══════════════════════════════════════════╝
             """
         }
@@ -223,13 +224,13 @@ pipeline {
         }
         cleanup {
             sh '''
-            echo "=== Pruning old local images (keep last 3) ==="
-            docker images ${REGISTRY}/${IMAGE_NAME} \
+            echo "=== Removing old docker images (keep last 3) ==="
+            docker images ${IMAGE_NAME} \
                 --format "{{.Tag}}" \
-                | grep "^capp-" \
-                | sort -t- -k2 -n \
+                | grep "^sit" \
+                | sort -t t -k2 -n \
                 | head -n -3 \
-                | xargs -I{} docker rmi ${REGISTRY}/${IMAGE_NAME}:{} || true
+                | xargs -I{} docker rmi ${IMAGE_NAME}:{} || true
             '''
         }
     }
