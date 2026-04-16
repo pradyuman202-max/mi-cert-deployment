@@ -139,7 +139,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 5. Helm deploy
+        // 5. Helm deploy + force pod restart
         // ─────────────────────────────────────────────
         stage('Helm Deploy (Dev)') {
             steps {
@@ -148,8 +148,15 @@ pipeline {
                 helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
                     -f ${VALUES_FILE} \
                     -n ${K8S_NAMESPACE} \
-                    --wait \
                     --timeout 3m0s
+
+                echo "=== Forcing pod restart to pull new image ==="
+                kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
+
+                echo "=== Waiting for rollout to complete ==="
+                kubectl rollout status deployment/mi-deployment \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=120s
 
                 echo "=== Helm release status ==="
                 helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE}
@@ -163,18 +170,13 @@ pipeline {
         stage('Verify Rollout') {
             steps {
                 sh '''
-                echo "=== Waiting for rollout ==="
-                kubectl rollout status deployment/mi-deployment \
-                    -n ${K8S_NAMESPACE} \
-                    --timeout=120s
-
                 echo "=== Pod status ==="
                 kubectl get pods -n ${K8S_NAMESPACE} -o wide
 
                 echo "=== Image running in pods ==="
                 kubectl get pods -n ${K8S_NAMESPACE} \
                     -o jsonpath="{.items[*].spec.containers[*].image}" \
-                    | tr ' ' '\n'
+                    | tr " " "\n"
                 '''
             }
         }
@@ -185,8 +187,9 @@ pipeline {
                 echo "=== Waiting 15s for MI to initialize ==="
                 sleep 15
 
+                # Fixed label: app=mi (matches actual pod labels)
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
-                    -l app.kubernetes.io/instance=${HELM_RELEASE} \
+                    -l app=mi \
                     -o jsonpath="{.items[0].metadata.name}")
 
                 echo "=== Checking pod: $POD ==="
@@ -215,9 +218,7 @@ pipeline {
             sh '''
             echo "=== FAILURE DIAGNOSTICS ==="
             kubectl get pods -n ${K8S_NAMESPACE} || true
-            kubectl describe pods -n ${K8S_NAMESPACE} \
-                -l app.kubernetes.io/instance=${HELM_RELEASE} \
-                | tail -40 || true
+            kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -40 || true
             '''
         }
         cleanup {
