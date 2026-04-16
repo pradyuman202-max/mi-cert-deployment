@@ -5,18 +5,18 @@ pipeline {
         // --- Project ---
         PROJECT_NAME        = "HelloWorld"
         CAPP_NAME           = "HelloWorldCompositeExporter"
-        CAPP_VERSION        = "1.0.0-SNAPSHOT"
+        // NOTE: CAPP_VERSION is NOT hardcoded here.
+        // It is read dynamically from pom.xml in the 'Verify CApp Artifact' stage.
 
         // --- Paths ---
         DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
-        CAPP_SOURCE_PATH    = "${DOCKER_PROJECT_PATH}/HelloWorld"
         CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Docker / Registry ---
         REGISTRY            = "localhost:5000"
         IMAGE_NAME          = "mi-sit"
         IMAGE_TAG           = "capp-${BUILD_NUMBER}"
-        FULL_IMAGE          = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+        FULL_IMAGE          = "${REGISTRY}/${IMAGE_NAME}:capp-${BUILD_NUMBER}"
 
         // --- Kubernetes ---
         K8S_NAMESPACE       = "mi"
@@ -28,58 +28,80 @@ pipeline {
     stages {
 
         // ─────────────────────────────────────────────
-        // 1. Checkout
+        // 1. Checkout — same repo, HelloWorld subfolder
         // ─────────────────────────────────────────────
         stage('Checkout Code') {
             steps {
                 git branch: 'main',
                     credentialsId: 'github-ssh-key',
-                    url: 'git@github.com:pradyuman202-max/HelloWorld.git'
+                    url: 'git@github.com:pradyuman202-max/mi-cert-deployment.git'
             }
         }
 
         stage('Verify Repo Files') {
             steps {
                 sh '''
-                echo "=== Workspace files ==="
+                echo "=== Workspace root ==="
                 ls -l
-                echo "=== Maven project structure ==="
-                find . -name "pom.xml" | head -20
+
+                echo "=== HelloWorld subfolder ==="
+                ls -l HelloWorld/
+
+                echo "=== Maven pom.xml files ==="
+                find HelloWorld -name "pom.xml"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
         // 2. Build CApp via Maven
+        //    - Runs inside HelloWorld/ subfolder
+        //    - Version read dynamically from pom.xml
         // ─────────────────────────────────────────────
         stage('Maven Build') {
             steps {
-                sh '''
-                echo "=== Building CApp with Maven ==="
-                mvn clean deploy \
-                    -Dmaven.test.skip=false \
-                    --batch-mode \
-                    --no-transfer-progress
-                '''
+                dir('HelloWorld') {
+                    sh '''
+                    echo "=== Reading version from pom.xml ==="
+                    CAPP_VERSION=$(mvn help:evaluate \
+                        -Dexpression=project.version \
+                        -q -DforceStdout)
+                    echo "Detected version: ${CAPP_VERSION}"
+
+                    echo "=== Building CApp with Maven ==="
+                    mvn clean deploy \
+                        --batch-mode \
+                        --no-transfer-progress
+                    '''
+                }
             }
         }
 
         stage('Verify CApp Artifact') {
             steps {
-                sh '''
-                echo "=== Looking for .car file ==="
-                find . -name "*.car" -type f
+                dir('HelloWorld') {
+                    script {
+                        // Read version dynamically — stored in env for all later stages
+                        def version = sh(
+                            script: "mvn help:evaluate -Dexpression=project.version -q -DforceStdout",
+                            returnStdout: true
+                        ).trim()
+                        env.CAPP_VERSION = version
+                        echo "CApp version resolved: ${env.CAPP_VERSION}"
 
-                CAR_FILE=$(find . -name "${CAPP_NAME}-${CAPP_VERSION}.car" -type f | head -1)
+                        def carFile = sh(
+                            script: "find . -name '${env.CAPP_NAME}-${env.CAPP_VERSION}.car' -type f | head -1",
+                            returnStdout: true
+                        ).trim()
 
-                if [ -z "$CAR_FILE" ]; then
-                    echo "ERROR: .car file not found! Check Maven build output."
-                    exit 1
-                fi
+                        if (carFile == '') {
+                            error("ERROR: .car file not found for version ${env.CAPP_VERSION}. Check Maven build output.")
+                        }
 
-                echo "Found CApp: $CAR_FILE"
-                ls -lh "$CAR_FILE"
-                '''
+                        echo "Found CApp: ${carFile}"
+                        sh "ls -lh '${carFile}'"
+                    }
+                }
             }
         }
 
@@ -88,16 +110,21 @@ pipeline {
         // ─────────────────────────────────────────────
         stage('Copy CApp to Docker Context') {
             steps {
-                sh '''
-                echo "=== Copying .car to Docker build context ==="
-                mkdir -p ${CAPP_DEST_DIR}
+                dir('HelloWorld') {
+                    sh '''
+                    echo "=== Clearing old .car files from capps/ ==="
+                    rm -f ${CAPP_DEST_DIR}/*.car
 
-                CAR_FILE=$(find . -name "${CAPP_NAME}-${CAPP_VERSION}.car" -type f | head -1)
-                cp "$CAR_FILE" ${CAPP_DEST_DIR}/
+                    echo "=== Copying new .car to Docker build context ==="
+                    mkdir -p ${CAPP_DEST_DIR}
 
-                echo "=== Contents of capps/ directory ==="
-                ls -lh ${CAPP_DEST_DIR}/
-                '''
+                    CAR_FILE=$(find . -name "${CAPP_NAME}-${CAPP_VERSION}.car" -type f | head -1)
+                    cp "$CAR_FILE" ${CAPP_DEST_DIR}/
+
+                    echo "=== Contents of capps/ ==="
+                    ls -lh ${CAPP_DEST_DIR}/
+                    '''
+                }
             }
         }
 
@@ -108,12 +135,15 @@ pipeline {
             steps {
                 sh '''
                 echo "=== Building Docker image: ${FULL_IMAGE} ==="
+                echo "=== CApp version baked in: ${CAPP_VERSION} ==="
                 cd ${DOCKER_PROJECT_PATH}
+
                 docker build \
                     --no-cache \
                     -t ${FULL_IMAGE} \
                     -t ${REGISTRY}/${IMAGE_NAME}:latest \
                     .
+
                 echo "=== Image built successfully ==="
                 docker images | grep ${IMAGE_NAME}
                 '''
@@ -123,18 +153,22 @@ pipeline {
         stage('Docker Push to Local Registry') {
             steps {
                 sh '''
-                echo "=== Pushing image to local registry ==="
-
-                # Verify local registry is up
+                echo "=== Verifying local registry is reachable ==="
                 if ! curl -sf http://${REGISTRY}/v2/_catalog > /dev/null; then
                     echo "ERROR: Local registry at ${REGISTRY} is not reachable."
-                    echo "Start it with: docker run -d -p 5000:5000 --name registry registry:2"
+                    echo "Run: docker run -d -p 5000:5000 --name local-registry registry:2"
                     exit 1
                 fi
 
+                echo "=== Pushing ${FULL_IMAGE} ==="
                 docker push ${FULL_IMAGE}
+
+                echo "=== Pushing latest tag ==="
                 docker push ${REGISTRY}/${IMAGE_NAME}:latest
 
+                echo "=== Registry contents after push ==="
+                curl -s http://${REGISTRY}/v2/_catalog
+                echo ""
                 echo "=== Push complete ==="
                 '''
             }
@@ -146,14 +180,13 @@ pipeline {
         stage('Update values-dev.yaml') {
             steps {
                 sh '''
-                echo "=== Updating image tag in values-dev.yaml ==="
+                echo "=== Updating image section in values-dev.yaml ==="
 
-                # Update repository and tag inline using sed
                 sed -i "s|repository:.*|repository: ${REGISTRY}/${IMAGE_NAME}|" ${VALUES_FILE}
-                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|" ${VALUES_FILE}
-                sed -i "s|pullPolicy:.*|pullPolicy: Always|" ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                            ${VALUES_FILE}
+                sed -i "s|pullPolicy:.*|pullPolicy: Always|"                    ${VALUES_FILE}
 
-                echo "=== Updated image section in values-dev.yaml ==="
+                echo "=== Current image section ==="
                 grep -A 3 "^image:" ${VALUES_FILE}
                 '''
             }
@@ -165,7 +198,7 @@ pipeline {
         stage('Helm Deploy (Dev)') {
             steps {
                 sh '''
-                echo "=== Deploying to Kubernetes namespace: ${K8S_NAMESPACE} ==="
+                echo "=== Deploying to namespace: ${K8S_NAMESPACE} ==="
                 helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
                     -f ${VALUES_FILE} \
                     -n ${K8S_NAMESPACE} \
@@ -184,7 +217,7 @@ pipeline {
         stage('Verify Rollout') {
             steps {
                 sh '''
-                echo "=== Waiting for rollout to complete ==="
+                echo "=== Waiting for rollout ==="
                 kubectl rollout status deployment/mi-deployment \
                     -n ${K8S_NAMESPACE} \
                     --timeout=120s
@@ -192,7 +225,7 @@ pipeline {
                 echo "=== Pod status ==="
                 kubectl get pods -n ${K8S_NAMESPACE} -o wide
 
-                echo "=== Image running in pod ==="
+                echo "=== Image running in pods ==="
                 kubectl get pods -n ${K8S_NAMESPACE} \
                     -o jsonpath="{.items[*].spec.containers[*].image}" \
                     | tr ' ' '\n'
@@ -203,46 +236,56 @@ pipeline {
         stage('Health Check') {
             steps {
                 sh '''
-                echo "=== Waiting for MI to be ready ==="
+                echo "=== Waiting 15s for MI to initialize ==="
                 sleep 15
 
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
                     -l app.kubernetes.io/instance=${HELM_RELEASE} \
                     -o jsonpath="{.items[0].metadata.name}")
 
-                echo "Checking pod: $POD"
+                echo "=== Checking pod: $POD ==="
 
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     curl -sf http://localhost:9164/healthz \
                     && echo "Health check PASSED" \
-                    || echo "Health check endpoint not available — check MI management port"
+                    || echo "Health endpoint not available — check MI management port config"
                 '''
             }
         }
     }
 
+    // ─────────────────────────────────────────────
+    // Post actions
+    // ─────────────────────────────────────────────
     post {
         success {
             echo """
             ╔══════════════════════════════════════════╗
-            ║   CApp Deployment SUCCESS                ║
-            ║   Image : ${FULL_IMAGE}
-            ║   Namespace : ${K8S_NAMESPACE}
+            ║        CApp Deployment SUCCESS           ║
+            ╠══════════════════════════════════════════╣
+            ║  Project   : ${PROJECT_NAME}
+            ║  CApp ver  : ${CAPP_VERSION}
+            ║  Image     : ${FULL_IMAGE}
+            ║  Namespace : ${K8S_NAMESPACE}
             ╚══════════════════════════════════════════╝
             """
         }
         failure {
             sh '''
-            echo "=== FAILURE: Last pod events ==="
+            echo "=== FAILURE DIAGNOSTICS ==="
+            echo "--- Pod list ---"
+            kubectl get pods -n ${K8S_NAMESPACE} || true
+
+            echo "--- Last pod events ---"
             kubectl describe pods -n ${K8S_NAMESPACE} \
                 -l app.kubernetes.io/instance=${HELM_RELEASE} \
-                | tail -30 || true
+                | tail -40 || true
             '''
-            echo "Pipeline FAILED. Check logs above."
+            echo "Pipeline FAILED. See diagnostics above."
         }
         cleanup {
             sh '''
-            echo "=== Cleaning up local Docker images older than 3 builds ==="
+            echo "=== Pruning old local images (keep last 3 builds) ==="
             docker images ${REGISTRY}/${IMAGE_NAME} \
                 --format "{{.Tag}}" \
                 | grep "^capp-" \

@@ -1,0 +1,12 @@
+<artifacts>
+<!-- 
+        Each artifact here corresponds to a file in HelloWorldConfigs.
+        name       = artifact name (must match what WSO2 registers internally)
+        version    = must match parent project version
+        type       = matches the packaging type of the source module
+        serverRole = set to EnterpriseServiceBus for MI
+     -->
+<artifact name="HelloWorldAPI" version="1.0.0-SNAPSHOT" type="synapse/api" serverRole="EnterpriseServiceBus">
+<dependency artifact="HelloWorldConfigs" version="1.0.0-SNAPSHOT" include="true" serverRole="EnterpriseServiceBus"/>
+</artifact>
+</artifacts>

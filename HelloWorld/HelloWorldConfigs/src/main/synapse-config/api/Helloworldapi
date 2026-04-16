@@ -1,0 +1,12 @@
+<api xmlns="http://ws.apache.org/ns/synapse" context="/hello" name="HelloWorldAPI">
+<resource methods="GET" uri-template="/">
+<inSequence>
+<payloadFactory media-type="json">
+<format>{"message": "Hello from WSO2 Micro Integrator!", "status": "OK"}</format>
+<args/>
+</payloadFactory>
+<respond/>
+</inSequence>
+<faultSequence/>
+</resource>
+</api>

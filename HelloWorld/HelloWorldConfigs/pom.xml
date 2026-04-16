@@ -1,0 +1,28 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+<modelVersion>4.0.0</modelVersion>
+<!--  ── Parent reference ───────────────────────────────────────────  -->
+<parent>
+<groupId>com.example</groupId>
+<artifactId>HelloWorld</artifactId>
+<version>1.0.0-SNAPSHOT</version>
+<relativePath>../pom.xml</relativePath>
+</parent>
+<!--  ── Module Identity ────────────────────────────────────────────  -->
+<artifactId>HelloWorldConfigs</artifactId>
+<!-- 
+        packaging = "synapse/configuration" tells the WSO2 Maven plugin
+        this module contains Synapse XML artifacts (APIs, sequences, etc.)
+     -->
+<packaging>synapse/configuration</packaging>
+<!--  ── WSO2 MI Maven Plugin ───────────────────────────────────────  -->
+<build>
+<plugins>
+<plugin>
+<groupId>org.wso2.maven</groupId>
+<artifactId>wso2-esb-config-maven-plugin</artifactId>
+<version>2.0.2</version>
+<extensions>true</extensions>
+</plugin>
+</plugins>
+</build>
+</project>
