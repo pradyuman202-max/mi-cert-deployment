@@ -11,10 +11,11 @@ pipeline {
         TRUSTSTORE_PASS       = "wso2carbon"
         TRUSTSTORE_BACKUP_DIR = "${DOCKER_PROJECT_PATH}/truststore-backups"
 
-        // --- Docker (mirrors CApp pipeline exactly) ---
+        // --- Docker ---
+        // IMAGE_TAG is resolved dynamically in 'Resolve Image Tag' stage
+        // by reading current tag from values-dev.yaml and incrementing by 1.
+        // This keeps cert pipeline and CApp pipeline in the same sit#### sequence.
         IMAGE_NAME            = "mi-sit"
-        IMAGE_TAG             = "sit${BUILD_NUMBER.padLeft(4, '0')}"
-        FULL_IMAGE            = "${IMAGE_NAME}:${IMAGE_TAG}"
 
         // --- Kind cluster ---
         KIND_CLUSTER          = "wso2-cluster"
@@ -54,29 +55,38 @@ pipeline {
 
                 echo "=== CApps available in build context (required by Dockerfile) ==="
                 ls -lh ${CAPP_DEST_DIR}/ || echo "WARNING: capps/ directory missing or empty"
+
+                echo "=== Current image tag in values-dev.yaml ==="
+                grep "tag:" ${VALUES_FILE} || echo "WARNING: could not read tag from values-dev.yaml"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 2. Certificate check — runs ONCE, sets flag
-        //    All downstream stages gate on CERT_FOUND
+        // 2. Certificate check — genuinely new cert?
+        //    Compares alias against existing truststore.
+        //    Runs ONCE. Sets CERT_FOUND flag for all
+        //    downstream stages.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
             steps {
                 script {
-                    def certCount = sh(
-                        script: 'find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l',
-                        returnStdout: true
-                    ).trim().toInteger()
+                    def certCheck = sh(
+                        script: """
+                        chmod +x scripts/this_cert_check.sh
+                        scripts/this_cert_check.sh \
+                            ${DOCKER_PROJECT_PATH}/${TRUSTSTORE} \
+                            ${TRUSTSTORE_PASS}
+                        """,
+                        returnStatus: true
+                    )
 
-                    if (certCount == 0) {
-                        echo "No new certificates found in workspace. All downstream stages will be skipped."
+                    if (certCheck != 0) {
+                        echo "No new certificates detected (all already imported or none present). Skipping all downstream stages."
                         currentBuild.description = "Skipped — no new certificate"
                         env.CERT_FOUND = "false"
                     } else {
-                        echo "Found ${certCount} certificate(s). Proceeding with full deployment."
-                        currentBuild.description = "Cert update — ${certCount} cert(s) — ${FULL_IMAGE}"
+                        echo "New certificate(s) detected. Proceeding with full deployment."
                         env.CERT_FOUND = "true"
                     }
                 }
@@ -84,7 +94,38 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Backup existing truststore (for rollback)
+        // 3. Resolve next image tag
+        //    Reads current sit#### from values-dev.yaml
+        //    and increments by 1 — keeps cert pipeline
+        //    and CApp pipeline in the same sequence.
+        // ─────────────────────────────────────────────
+        stage('Resolve Image Tag') {
+            when { environment name: 'CERT_FOUND', value: 'true' }
+            steps {
+                script {
+                    def currentTag = sh(
+                        script: "grep 'tag:' ${VALUES_FILE} | sed 's/.*tag: *//' | tr -d ' '",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Current tag in values-dev.yaml: ${currentTag}"
+
+                    // Extract number from sit#### and increment
+                    def currentNum = currentTag.replaceAll(/[^0-9]/, '').toInteger()
+                    def nextNum    = currentNum + 1
+                    def nextTag    = String.format("sit%04d", nextNum)
+
+                    env.IMAGE_TAG  = nextTag
+                    env.FULL_IMAGE = "${env.IMAGE_NAME}:${nextTag}"
+
+                    echo "New image tag: ${env.FULL_IMAGE}"
+                    currentBuild.description = "Cert update — ${env.FULL_IMAGE}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 4. Backup existing truststore (for rollback)
         // ─────────────────────────────────────────────
         stage('Backup Truststore') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -102,14 +143,14 @@ pipeline {
                     echo "=== Existing backups (latest first) ==="
                     ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -10
                 else
-                    echo "No existing truststore at $TRUSTSTORE_PATH — skipping backup."
+                    echo "No existing truststore found — skipping backup."
                 fi
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 4. Import all .crt / .cer into truststore
+        // 5. Import new certificates into truststore
         // ─────────────────────────────────────────────
         stage('Import Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -137,7 +178,7 @@ pipeline {
                     echo "Empty truststore created."
                 fi
 
-                # Import every cert found in workspace root
+                # Import every new cert found in workspace root
                 find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
                     echo "--- Importing: $CERT  →  alias: $ALIAS ---"
@@ -150,7 +191,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 5. Verify truststore contents
+        // 6. Verify truststore contents
         // ─────────────────────────────────────────────
         stage('Verify Truststore') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -165,11 +206,8 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 6. Docker Build
-        //    Dockerfile needs BOTH:
-        //      - client-truststore.jks  (updated by this pipeline)
-        //      - capps/*.car            (carried over from last CApp build)
-        //    Guard ensures capps/ is never empty before build starts.
+        // 7. Docker Build — new image with updated
+        //    truststore baked in (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Docker Build') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -184,7 +222,7 @@ pipeline {
                 fi
                 echo "Truststore : OK — $(ls -lh ${DOCKER_PROJECT_PATH}/${TRUSTSTORE})"
 
-                # CApp check — Dockerfile has COPY capps/*.car so capps/ must not be empty
+                # CApp check — Dockerfile has COPY capps/*.car, must not be empty
                 CAR_COUNT=$(find ${CAPP_DEST_DIR} -name "*.car" -type f 2>/dev/null | wc -l)
                 if [ "$CAR_COUNT" -eq 0 ]; then
                     echo "ERROR: No .car files found in ${CAPP_DEST_DIR}/"
@@ -208,7 +246,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 7. Load image into Kind (mirrors CApp pipeline)
+        // 8. Load image into Kind (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Load Image into Kind') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -224,7 +262,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 8. Update values-dev.yaml with new tag
+        // 9. Update values-dev.yaml with new tag
         //    (mirrors CApp pipeline exactly)
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
@@ -244,7 +282,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 9. Update Kubernetes ConfigMap with new truststore
+        // 10. Update Kubernetes ConfigMap
         // ─────────────────────────────────────────────
         stage('Update Kubernetes ConfigMap') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -267,7 +305,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 10. Helm deploy + rollout (mirrors CApp pipeline)
+        // 11. Helm deploy + rollout (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Helm Deploy') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -293,7 +331,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 11. Verify deployment (mirrors CApp pipeline)
+        // 12. Verify deployment (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Verify Deployment') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -314,7 +352,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 12. Health check (mirrors CApp pipeline)
+        // 13. Health check (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Health Check') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -339,7 +377,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 13. Archive processed certs out of workspace root
+        // 14. Archive processed certs out of workspace
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -370,7 +408,7 @@ pipeline {
 ╔══════════════════════════════════════════════════════╗
 ║        Certificate Deployment SUCCESS                ║
 ╠══════════════════════════════════════════════════════╣
-║  Image       : ${FULL_IMAGE}
+║  Image       : ${env.FULL_IMAGE}
 ║  Truststore  : ${TRUSTSTORE}
 ║  ConfigMap   : ${CONFIGMAP_NAME}
 ║  Namespace   : ${K8S_NAMESPACE}
