@@ -4,19 +4,18 @@ pipeline {
     environment {
         // --- Project ---
         PROJECT_NAME        = "HelloWorld"
-        CAR_FILE            = "HelloWorldCompositeExporter-1.0.0-SNAPSHOT.car"
+        // NOTE: No hardcoded CAR_FILE — all .car files in HelloWorld/ are picked up
 
         // --- Paths ---
         DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
         CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Docker ---
-        // No registry push needed — image loaded directly into kind
         IMAGE_NAME          = "mi-sit"
         IMAGE_TAG           = "sit${BUILD_NUMBER.padLeft(4, '0')}"
         FULL_IMAGE          = "${IMAGE_NAME}:${IMAGE_TAG}"
 
-        // --- Kind cluster name (from: kubectl get nodes) ---
+        // --- Kind cluster ---
         KIND_CLUSTER        = "wso2-cluster"
 
         // --- Kubernetes ---
@@ -48,32 +47,40 @@ pipeline {
                 echo "=== HelloWorld subfolder ==="
                 ls -l HelloWorld/
 
-                echo "=== Verifying .car file exists ==="
-                if [ ! -f "HelloWorld/${CAR_FILE}" ]; then
-                    echo "ERROR: ${CAR_FILE} not found in HelloWorld/"
+                echo "=== All .car files found in HelloWorld/ ==="
+                find HelloWorld -name "*.car" -type f
+
+                CAR_COUNT=$(find HelloWorld -name "*.car" -type f | wc -l)
+                echo "Total .car files: ${CAR_COUNT}"
+
+                if [ "$CAR_COUNT" -eq 0 ]; then
+                    echo "ERROR: No .car files found in HelloWorld/"
                     exit 1
                 fi
-                echo "Found: HelloWorld/${CAR_FILE}"
-                ls -lh HelloWorld/${CAR_FILE}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 2. Copy .car to Docker build context
+        // 2. Copy ALL .car files to Docker build context
         // ─────────────────────────────────────────────
-        stage('Copy CApp to Docker Context') {
+        stage('Copy CApps to Docker Context') {
             steps {
                 sh '''
                 echo "=== Clearing old .car files from capps/ ==="
                 rm -f ${CAPP_DEST_DIR}/*.car
 
-                echo "=== Copying ${CAR_FILE} to Docker context ==="
+                echo "=== Copying ALL .car files from HelloWorld/ ==="
                 mkdir -p ${CAPP_DEST_DIR}
-                cp HelloWorld/${CAR_FILE} ${CAPP_DEST_DIR}/
+
+                find HelloWorld -name "*.car" -type f | while read CAR; do
+                    echo "  Copying: $CAR"
+                    cp "$CAR" ${CAPP_DEST_DIR}/
+                done
 
                 echo "=== Contents of capps/ ==="
                 ls -lh ${CAPP_DEST_DIR}/
+                echo "Total .car files staged: $(ls ${CAPP_DEST_DIR}/*.car | wc -l)"
                 '''
             }
         }
@@ -85,8 +92,10 @@ pipeline {
             steps {
                 sh '''
                 echo "=== Building Docker image: ${FULL_IMAGE} ==="
-                cd ${DOCKER_PROJECT_PATH}
+                echo "=== CApps baked in: ==="
+                ls -lh ${CAPP_DEST_DIR}/
 
+                cd ${DOCKER_PROJECT_PATH}
                 docker build \
                     --no-cache \
                     -t ${FULL_IMAGE} \
@@ -99,8 +108,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 4. Load image directly into kind cluster
-        //    (avoids localhost:5000 registry pull issue)
+        // 4. Load image directly into kind
         // ─────────────────────────────────────────────
         stage('Load Image into Kind') {
             steps {
@@ -108,37 +116,32 @@ pipeline {
                 echo "=== Loading ${FULL_IMAGE} into kind cluster: ${KIND_CLUSTER} ==="
                 kind load docker-image ${FULL_IMAGE} --name ${KIND_CLUSTER}
 
-                echo "=== Verifying image loaded into kind ==="
+                echo "=== All mi-sit images in kind ==="
                 docker exec ${KIND_CLUSTER}-control-plane crictl images | grep ${IMAGE_NAME}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 5. Update values-dev.yaml
-        //    Tag format: sit0001, sit0002 ... easy rollback
-        //    To rollback: change tag to sit0005 → helm upgrade
+        // 5. Update values-dev.yaml with new tag
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
             steps {
                 sh '''
                 echo "=== Updating image section in values-dev.yaml ==="
 
-                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"   ${VALUES_FILE}
-                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                  ${VALUES_FILE}
-                # IfNotPresent — image already loaded into kind, no pull needed
-                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"     ${VALUES_FILE}
+                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"  ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                 ${VALUES_FILE}
+                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"   ${VALUES_FILE}
 
                 echo "=== Current image section ==="
                 grep -A 3 "^image:" ${VALUES_FILE}
-                echo ""
-                echo "=== To rollback: change tag to previous sit#### and run helm upgrade ==="
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 6. Helm deploy + force pod restart
+        // 6. Helm deploy + rollout
         // ─────────────────────────────────────────────
         stage('Helm Deploy (Dev)') {
             steps {
@@ -157,7 +160,6 @@ pipeline {
                     -n ${K8S_NAMESPACE} \
                     --timeout=120s
 
-                echo "=== Helm release status ==="
                 helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE}
                 '''
             }
@@ -176,6 +178,14 @@ pipeline {
                 kubectl get pods -n ${K8S_NAMESPACE} \
                     -o jsonpath="{.items[*].spec.containers[*].image}" \
                     | tr " " "\n"
+
+                echo "=== CApps deployed inside pod ==="
+                POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
+                    -l app=mi \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath="{.items[0].metadata.name}")
+                kubectl exec $POD -n ${K8S_NAMESPACE} -- \
+                    ls -lh /home/wso2carbon/wso2mi-4.3.0/repository/deployment/server/carbonapps/
                 '''
             }
         }
@@ -188,13 +198,15 @@ pipeline {
 
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
                     -l app=mi \
+                    --field-selector=status.phase=Running \
                     -o jsonpath="{.items[0].metadata.name}")
 
                 echo "=== Checking pod: $POD ==="
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
-                    curl -sf http://localhost:9164/healthz \
-                    && echo "Health check PASSED" \
-                    || echo "Health endpoint not available — check MI management port"
+                    curl -sf http://localhost:9164/management/apis \
+                    -H "Authorization: Basic YWRtaW46YWRtaW4=" \
+                    && echo "Management API reachable — APIs listed above" \
+                    || echo "Management API not reachable — MI may still be starting"
                 '''
             }
         }
@@ -203,16 +215,18 @@ pipeline {
     post {
         success {
             echo """
-            ╔══════════════════════════════════════════╗
-            ║        CApp Deployment SUCCESS           ║
-            ╠══════════════════════════════════════════╣
-            ║  CApp    : ${CAR_FILE}
-            ║  Image   : ${FULL_IMAGE}
-            ║  NS      : ${K8S_NAMESPACE}
-            ║
-            ║  ROLLBACK: set tag to previous sit####
-            ║  in values-dev.yaml → helm upgrade
-            ╚══════════════════════════════════════════╝
+            ╔══════════════════════════════════════════════════╗
+            ║         CApp Deployment SUCCESS                  ║
+            ╠══════════════════════════════════════════════════╣
+            ║  Image     : ${FULL_IMAGE}
+            ║  Namespace : ${K8S_NAMESPACE}
+            ║  Build     : #${BUILD_NUMBER}
+            ╠══════════════════════════════════════════════════╣
+            ║  ROLLBACK STEPS:                                 ║
+            ║  1. sed -i "s|tag:.*|tag: sit####|" values-dev.yaml
+            ║  2. helm upgrade mi ./helm -f values-dev.yaml -n mi
+            ║  3. kubectl rollout restart deployment/mi-deployment -n mi
+            ╚══════════════════════════════════════════════════╝
             """
         }
         failure {
@@ -224,7 +238,7 @@ pipeline {
         }
         cleanup {
             sh '''
-            echo "=== Removing old docker images (keep last 3) ==="
+            echo "=== Pruning old local images (keep last 3) ==="
             docker images ${IMAGE_NAME} \
                 --format "{{.Tag}}" \
                 | grep "^sit" \
