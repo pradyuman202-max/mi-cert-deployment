@@ -4,11 +4,20 @@ pipeline {
     environment {
         // --- Paths ---
         DOCKER_PROJECT_PATH   = "/home/svc_account_wso2/SIT_MI_Docker_Project"
+        CAPP_DEST_DIR         = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Truststore ---
         TRUSTSTORE            = "client-truststore.jks"
         TRUSTSTORE_PASS       = "wso2carbon"
         TRUSTSTORE_BACKUP_DIR = "${DOCKER_PROJECT_PATH}/truststore-backups"
+
+        // --- Docker (mirrors CApp pipeline exactly) ---
+        IMAGE_NAME            = "mi-sit"
+        IMAGE_TAG             = "sit${BUILD_NUMBER.padLeft(4, '0')}"
+        FULL_IMAGE            = "${IMAGE_NAME}:${IMAGE_TAG}"
+
+        // --- Kind cluster ---
+        KIND_CLUSTER          = "wso2-cluster"
 
         // --- Kubernetes ---
         K8S_NAMESPACE         = "mi"
@@ -42,12 +51,16 @@ pipeline {
 
                 echo "=== Certificate files in workspace ==="
                 find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) || echo "None found"
+
+                echo "=== CApps available in build context (required by Dockerfile) ==="
+                ls -lh ${CAPP_DEST_DIR}/ || echo "WARNING: capps/ directory missing or empty"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
         // 2. Certificate check — runs ONCE, sets flag
+        //    All downstream stages gate on CERT_FOUND
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
             steps {
@@ -63,7 +76,7 @@ pipeline {
                         env.CERT_FOUND = "false"
                     } else {
                         echo "Found ${certCount} certificate(s). Proceeding with full deployment."
-                        currentBuild.description = "Certificate update — ${certCount} cert(s)"
+                        currentBuild.description = "Cert update — ${certCount} cert(s) — ${FULL_IMAGE}"
                         env.CERT_FOUND = "true"
                     }
                 }
@@ -89,7 +102,7 @@ pipeline {
                     echo "=== Existing backups (latest first) ==="
                     ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -10
                 else
-                    echo "No existing truststore found at $TRUSTSTORE_PATH — nothing to back up."
+                    echo "No existing truststore at $TRUSTSTORE_PATH — skipping backup."
                 fi
                 '''
             }
@@ -152,7 +165,86 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 6. Update Kubernetes ConfigMap with new truststore
+        // 6. Docker Build
+        //    Dockerfile needs BOTH:
+        //      - client-truststore.jks  (updated by this pipeline)
+        //      - capps/*.car            (carried over from last CApp build)
+        //    Guard ensures capps/ is never empty before build starts.
+        // ─────────────────────────────────────────────
+        stage('Docker Build') {
+            when { environment name: 'CERT_FOUND', value: 'true' }
+            steps {
+                sh '''
+                echo "=== Pre-build context check ==="
+
+                # Truststore check
+                if [ ! -f "${DOCKER_PROJECT_PATH}/${TRUSTSTORE}" ]; then
+                    echo "ERROR: Truststore not found at ${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
+                    exit 1
+                fi
+                echo "Truststore : OK — $(ls -lh ${DOCKER_PROJECT_PATH}/${TRUSTSTORE})"
+
+                # CApp check — Dockerfile has COPY capps/*.car so capps/ must not be empty
+                CAR_COUNT=$(find ${CAPP_DEST_DIR} -name "*.car" -type f 2>/dev/null | wc -l)
+                if [ "$CAR_COUNT" -eq 0 ]; then
+                    echo "ERROR: No .car files found in ${CAPP_DEST_DIR}/"
+                    echo "       Run the CApp pipeline at least once before the cert pipeline."
+                    exit 1
+                fi
+                echo "CApps      : OK — ${CAR_COUNT} .car file(s) in capps/"
+                ls -lh ${CAPP_DEST_DIR}/
+
+                echo "=== Building Docker image: ${FULL_IMAGE} ==="
+                cd ${DOCKER_PROJECT_PATH}
+                docker build \
+                    --no-cache \
+                    -t ${FULL_IMAGE} \
+                    .
+
+                echo "=== Image built successfully ==="
+                docker images | grep ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 7. Load image into Kind (mirrors CApp pipeline)
+        // ─────────────────────────────────────────────
+        stage('Load Image into Kind') {
+            when { environment name: 'CERT_FOUND', value: 'true' }
+            steps {
+                sh '''
+                echo "=== Loading ${FULL_IMAGE} into kind cluster: ${KIND_CLUSTER} ==="
+                kind load docker-image ${FULL_IMAGE} --name ${KIND_CLUSTER}
+
+                echo "=== All mi-sit images in kind ==="
+                docker exec ${KIND_CLUSTER}-control-plane crictl images | grep ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 8. Update values-dev.yaml with new tag
+        //    (mirrors CApp pipeline exactly)
+        // ─────────────────────────────────────────────
+        stage('Update values-dev.yaml') {
+            when { environment name: 'CERT_FOUND', value: 'true' }
+            steps {
+                sh '''
+                echo "=== Updating image section in values-dev.yaml ==="
+
+                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"  ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                 ${VALUES_FILE}
+                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"   ${VALUES_FILE}
+
+                echo "=== Current image section in values-dev.yaml ==="
+                grep -A 3 "^image:" ${VALUES_FILE}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 9. Update Kubernetes ConfigMap with new truststore
         // ─────────────────────────────────────────────
         stage('Update Kubernetes ConfigMap') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -168,26 +260,26 @@ pipeline {
                     --from-file=${DOCKER_PROJECT_PATH}/${TRUSTSTORE} \
                     -n ${K8S_NAMESPACE}
 
-                echo "ConfigMap updated successfully."
+                echo "=== ConfigMap updated ==="
                 kubectl describe configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 7. Helm deploy + rollout (mirrors CApp pipeline)
+        // 10. Helm deploy + rollout (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Helm Deploy') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Deploying with Helm — namespace: ${K8S_NAMESPACE} ==="
+                echo "=== Deploying to namespace: ${K8S_NAMESPACE} ==="
                 helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
                     -f ${VALUES_FILE} \
                     -n ${K8S_NAMESPACE} \
                     --timeout 3m0s
 
-                echo "=== Forcing pod restart to mount new truststore ==="
+                echo "=== Forcing pod restart to use new image + truststore ==="
                 kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
 
                 echo "=== Waiting for rollout ==="
@@ -201,7 +293,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 8. Verify deployment (mirrors CApp pipeline)
+        // 11. Verify deployment (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Verify Deployment') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -222,7 +314,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 9. Health check (mirrors CApp pipeline)
+        // 12. Health check (mirrors CApp pipeline)
         // ─────────────────────────────────────────────
         stage('Health Check') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -240,14 +332,14 @@ pipeline {
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     curl -sf http://localhost:9164/management/apis \
                     -H "Authorization: Basic YWRtaW46YWRtaW4=" \
-                    && echo "Management API reachable — truststore update confirmed" \
+                    && echo "Management API reachable — image + truststore confirmed" \
                     || echo "Management API not reachable — MI may still be starting"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 10. Archive processed certs out of workspace root
+        // 13. Archive processed certs out of workspace root
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -268,7 +360,7 @@ pipeline {
     }
 
     // ─────────────────────────────────────────────
-    // Post actions
+    // Post actions (mirrors CApp pipeline)
     // ─────────────────────────────────────────────
     post {
         success {
@@ -278,21 +370,29 @@ pipeline {
 ╔══════════════════════════════════════════════════════╗
 ║        Certificate Deployment SUCCESS                ║
 ╠══════════════════════════════════════════════════════╣
+║  Image       : ${FULL_IMAGE}
 ║  Truststore  : ${TRUSTSTORE}
 ║  ConfigMap   : ${CONFIGMAP_NAME}
 ║  Namespace   : ${K8S_NAMESPACE}
 ║  Build       : #${BUILD_NUMBER}
 ╠══════════════════════════════════════════════════════╣
-║  ROLLBACK STEPS (if needed):                         ║
-║  1. Find backup:                                     ║
-║     ls -lht ${TRUSTSTORE_BACKUP_DIR}/
-║  2. Delete current ConfigMap:                        ║
-║     kubectl delete configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
-║  3. Restore from backup:                             ║
-║     kubectl create configmap ${CONFIGMAP_NAME} \\
-║       --from-file=<backup.jks> -n ${K8S_NAMESPACE}
-║  4. Restart pods:                                    ║
-║     kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
+║  ROLLBACK STEPS:                                     ║
+║                                                      ║
+║  -- Image rollback --                                ║
+║  1. sed -i "s|tag:.*|tag: sit####|" ${VALUES_FILE}
+║  2. helm upgrade mi ${HELM_CHART_PATH} \\
+║        -f ${VALUES_FILE} -n ${K8S_NAMESPACE}
+║  3. kubectl rollout restart deployment/mi-deployment \\
+║        -n ${K8S_NAMESPACE}
+║                                                      ║
+║  -- Truststore rollback --                           ║
+║  1. ls -lht ${TRUSTSTORE_BACKUP_DIR}/
+║  2. kubectl delete configmap ${CONFIGMAP_NAME} \\
+║        -n ${K8S_NAMESPACE}
+║  3. kubectl create configmap ${CONFIGMAP_NAME} \\
+║        --from-file=<backup.jks> -n ${K8S_NAMESPACE}
+║  4. kubectl rollout restart deployment/mi-deployment \\
+║        -n ${K8S_NAMESPACE}
 ╚══════════════════════════════════════════════════════╝
                     """
                 } else {
@@ -311,6 +411,17 @@ pipeline {
 
             echo "=== Truststore backups available for manual rollback ==="
             ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -5 || true
+            '''
+        }
+        cleanup {
+            sh '''
+            echo "=== Pruning old local images (keep last 3) ==="
+            docker images ${IMAGE_NAME} \
+                --format "{{.Tag}}" \
+                | grep "^sit" \
+                | sort -t t -k2 -n \
+                | head -n -3 \
+                | xargs -I{} docker rmi ${IMAGE_NAME}:{} || true
             '''
         }
     }
