@@ -1,14 +1,8 @@
-# ── Dev Environment Values ───────────────────────────────────────────────────
-# This file is auto-updated by the Jenkins pipeline (image.tag field).
-# Do NOT manually hardcode the tag here — it is managed by CI/CD.
-# ─────────────────────────────────────────────────────────────────────────────
-
-cat > /home/svc_account_wso2/SIT_MI_Docker_Project/values-dev.yaml << 'EOF'
 replicaCount: 1
 
 image:
   repository: mi-sit
-  tag: sit0001
+  tag: sit0011
   pullPolicy: IfNotPresent
 
 service:
@@ -30,7 +24,3 @@ resources:
   limits:
     memory: "1Gi"
     cpu: "1"
-
-env: dev
-debug: true
-EOF
