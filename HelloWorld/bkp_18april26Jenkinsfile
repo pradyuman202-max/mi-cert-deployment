@@ -4,6 +4,7 @@ pipeline {
     environment {
         // --- Project ---
         PROJECT_NAME        = "HelloWorld"
+        // NOTE: No hardcoded CAR_FILE — all .car files in HelloWorld/ are picked up
 
         // --- Paths ---
         DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
@@ -11,9 +12,8 @@ pipeline {
 
         // --- Docker ---
         IMAGE_NAME          = "mi-sit"
-        // IMAGE_TAG is resolved dynamically in 'Resolve Image Tag' stage
-        // by reading current tag from values-dev.yaml and incrementing by 1.
-        // This keeps cert pipeline and CApp pipeline in the same sit#### sequence.
+        IMAGE_TAG           = "sit${BUILD_NUMBER.padLeft(4, '0')}"
+        FULL_IMAGE          = "${IMAGE_NAME}:${IMAGE_TAG}"
 
         // --- Kind cluster ---
         KIND_CLUSTER        = "wso2-cluster"
@@ -51,80 +51,20 @@ pipeline {
                 find HelloWorld -name "*.car" -type f
 
                 CAR_COUNT=$(find HelloWorld -name "*.car" -type f | wc -l)
-                echo "Total .car files in workspace: ${CAR_COUNT}"
+                echo "Total .car files: ${CAR_COUNT}"
 
-                echo "=== Currently deployed .car files in capps/ ==="
-                ls -lh ${CAPP_DEST_DIR}/ || echo "capps/ is empty or missing"
-
-                echo "=== Current image tag in values-dev.yaml ==="
-                grep "tag:" ${VALUES_FILE} || echo "WARNING: could not read tag"
+                if [ "$CAR_COUNT" -eq 0 ]; then
+                    echo "ERROR: No .car files found in HelloWorld/"
+                    exit 1
+                fi
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 2. CApp change detection — runs ONCE
-        //    Checks for new files OR changed checksums.
-        //    Sets CAPP_CHANGED flag for all downstream stages.
-        // ─────────────────────────────────────────────
-        stage('CApp Change Check') {
-            steps {
-                script {
-                    def carpCheck = sh(
-                        script: """
-                        chmod +x scripts/capp_check.sh
-                        scripts/capp_check.sh HelloWorld ${CAPP_DEST_DIR}
-                        """,
-                        returnStatus: true
-                    )
-
-                    if (carpCheck != 0) {
-                        echo "No new or updated CApps detected. All downstream stages will be skipped."
-                        currentBuild.description = "Skipped — no CApp changes"
-                        env.CAPP_CHANGED = "false"
-                    } else {
-                        echo "New or updated CApp(s) detected. Proceeding with full deployment."
-                        env.CAPP_CHANGED = "true"
-                    }
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 3. Resolve next image tag
-        //    Reads current sit#### from values-dev.yaml
-        //    and increments by 1. Shared sequence with
-        //    cert pipeline — never out of sync.
-        // ─────────────────────────────────────────────
-        stage('Resolve Image Tag') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
-            steps {
-                script {
-                    def currentTag = sh(
-                        script: "grep 'tag:' ${VALUES_FILE} | sed 's/.*tag: *//' | tr -d ' '",
-                        returnStdout: true
-                    ).trim()
-
-                    echo "Current tag in values-dev.yaml: ${currentTag}"
-
-                    def currentNum = currentTag.replaceAll(/[^0-9]/, '').toInteger()
-                    def nextNum    = currentNum + 1
-                    def nextTag    = String.format("sit%04d", nextNum)
-
-                    env.IMAGE_TAG  = nextTag
-                    env.FULL_IMAGE = "${env.IMAGE_NAME}:${nextTag}"
-
-                    echo "New image tag: ${env.FULL_IMAGE}"
-                    currentBuild.description = "CApp deploy — ${env.FULL_IMAGE}"
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 4. Copy changed/new .car files to Docker build context
+        // 2. Copy ALL .car files to Docker build context
         // ─────────────────────────────────────────────
         stage('Copy CApps to Docker Context') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Clearing old .car files from capps/ ==="
@@ -146,14 +86,13 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 5. Docker build
+        // 3. Docker build
         // ─────────────────────────────────────────────
         stage('Docker Build') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Building Docker image: ${FULL_IMAGE} ==="
-                echo "=== CApps baked in ==="
+                echo "=== CApps baked in: ==="
                 ls -lh ${CAPP_DEST_DIR}/
 
                 cd ${DOCKER_PROJECT_PATH}
@@ -169,10 +108,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 6. Load image into Kind
+        // 4. Load image directly into kind
         // ─────────────────────────────────────────────
         stage('Load Image into Kind') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Loading ${FULL_IMAGE} into kind cluster: ${KIND_CLUSTER} ==="
@@ -185,10 +123,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 7. Update values-dev.yaml with new tag
+        // 5. Update values-dev.yaml with new tag
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Updating image section in values-dev.yaml ==="
@@ -204,10 +141,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 8. Helm deploy + rollout
+        // 6. Helm deploy + rollout
         // ─────────────────────────────────────────────
-        stage('Helm Deploy') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
+        stage('Helm Deploy (Dev)') {
             steps {
                 sh '''
                 echo "=== Deploying to namespace: ${K8S_NAMESPACE} ==="
@@ -230,10 +166,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 9. Verify rollout
+        // 7. Verify
         // ─────────────────────────────────────────────
         stage('Verify Rollout') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Pod status ==="
@@ -242,7 +177,7 @@ pipeline {
                 echo "=== Image running in pods ==="
                 kubectl get pods -n ${K8S_NAMESPACE} \
                     -o jsonpath="{.items[*].spec.containers[*].image}" \
-                    | tr " " "\\n"
+                    | tr " " "\n"
 
                 echo "=== CApps deployed inside pod ==="
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
@@ -255,11 +190,7 @@ pipeline {
             }
         }
 
-        // ─────────────────────────────────────────────
-        // 10. Health check
-        // ─────────────────────────────────────────────
         stage('Health Check') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
             steps {
                 sh '''
                 echo "=== Waiting 15s for MI to initialize ==="
@@ -274,49 +205,35 @@ pipeline {
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     curl -sf http://localhost:9164/management/apis \
                     -H "Authorization: Basic YWRtaW46YWRtaW4=" \
-                    && echo "Management API reachable — CApps deployed" \
+                    && echo "Management API reachable — APIs listed above" \
                     || echo "Management API not reachable — MI may still be starting"
                 '''
             }
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Post actions
-    // ─────────────────────────────────────────────
     post {
         success {
-            script {
-                if (env.CAPP_CHANGED == 'true') {
-                    echo """
-╔══════════════════════════════════════════════════════╗
-║           CApp Deployment SUCCESS                    ║
-╠══════════════════════════════════════════════════════╣
-║  Image     : ${env.FULL_IMAGE}
-║  Namespace : ${K8S_NAMESPACE}
-║  Build     : #${BUILD_NUMBER}
-╠══════════════════════════════════════════════════════╣
-║  ROLLBACK STEPS:                                     ║
-║  1. sed -i "s|tag:.*|tag: sit####|" ${VALUES_FILE}
-║  2. helm upgrade mi ${HELM_CHART_PATH} \\
-║        -f ${VALUES_FILE} -n ${K8S_NAMESPACE}
-║  3. kubectl rollout restart deployment/mi-deployment \\
-║        -n ${K8S_NAMESPACE}
-╚══════════════════════════════════════════════════════╝
-                    """
-                } else {
-                    echo "Pipeline completed — no new or updated CApps detected, all stages skipped cleanly."
-                }
-            }
+            echo """
+            ╔══════════════════════════════════════════════════╗
+            ║         CApp Deployment SUCCESS                  ║
+            ╠══════════════════════════════════════════════════╣
+            ║  Image     : ${FULL_IMAGE}
+            ║  Namespace : ${K8S_NAMESPACE}
+            ║  Build     : #${BUILD_NUMBER}
+            ╠══════════════════════════════════════════════════╣
+            ║  ROLLBACK STEPS:                                 ║
+            ║  1. sed -i "s|tag:.*|tag: sit####|" values-dev.yaml
+            ║  2. helm upgrade mi ./helm -f values-dev.yaml -n mi
+            ║  3. kubectl rollout restart deployment/mi-deployment -n mi
+            ╚══════════════════════════════════════════════════╝
+            """
         }
         failure {
             sh '''
             echo "=== FAILURE DIAGNOSTICS ==="
             kubectl get pods -n ${K8S_NAMESPACE} || true
             kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -40 || true
-
-            echo "=== Helm status ==="
-            helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE} || true
             '''
         }
         cleanup {
@@ -332,4 +249,3 @@ pipeline {
         }
     }
 }
-
