@@ -4,28 +4,15 @@ pipeline {
     environment {
         // --- Paths ---
         DOCKER_PROJECT_PATH   = "/home/svc_account_wso2/SIT_MI_Docker_Project"
-        CAPP_DEST_DIR         = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Truststore ---
         TRUSTSTORE            = "client-truststore.jks"
         TRUSTSTORE_PASS       = "wso2carbon"
         TRUSTSTORE_BACKUP_DIR = "${DOCKER_PROJECT_PATH}/truststore-backups"
 
-        // --- Docker ---
-        // IMAGE_TAG is resolved dynamically in 'Resolve Image Tag' stage
-        // by reading current tag from values-dev.yaml and incrementing by 1.
-        // This keeps cert pipeline and CApp pipeline in the same sit#### sequence.
-        IMAGE_NAME            = "mi-sit"
-
-        // --- Kind cluster ---
-        KIND_CLUSTER          = "wso2-cluster"
-
         // --- Kubernetes ---
         K8S_NAMESPACE         = "mi"
         CONFIGMAP_NAME        = "mi-truststore-config"
-        HELM_RELEASE          = "mi"
-        HELM_CHART_PATH       = "${DOCKER_PROJECT_PATH}/helm"
-        VALUES_FILE           = "${DOCKER_PROJECT_PATH}/values-dev.yaml"
     }
 
     stages {
@@ -50,23 +37,18 @@ pipeline {
                 echo "=== Scripts ==="
                 ls -l scripts/
 
-                echo "=== Certificate files in workspace ==="
+                echo "=== Certificate files in workspace root ==="
                 find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) || echo "None found"
 
-                echo "=== CApps available in build context (required by Dockerfile) ==="
-                ls -lh ${CAPP_DEST_DIR}/ || echo "WARNING: capps/ directory missing or empty"
-
-                echo "=== Current image tag in values-dev.yaml ==="
-                grep "tag:" ${VALUES_FILE} || echo "WARNING: could not read tag from values-dev.yaml"
+                echo "=== Already archived certificates ==="
+                ls -lh certificates/ || echo "certificates/ is empty or missing"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 2. Certificate check — genuinely new cert?
-        //    Compares alias against existing truststore.
-        //    Runs ONCE. Sets CERT_FOUND flag for all
-        //    downstream stages.
+        // 2. Certificate check — alias-based detection
+        //    Runs ONCE. Sets CERT_FOUND flag.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
             steps {
@@ -82,11 +64,11 @@ pipeline {
                     )
 
                     if (certCheck != 0) {
-                        echo "No new certificates detected (all already imported or none present). Skipping all downstream stages."
+                        echo "No new certificates detected. All downstream stages will be skipped."
                         currentBuild.description = "Skipped — no new certificate"
                         env.CERT_FOUND = "false"
                     } else {
-                        echo "New certificate(s) detected. Proceeding with full deployment."
+                        echo "New certificate(s) detected. Proceeding with deployment."
                         env.CERT_FOUND = "true"
                     }
                 }
@@ -94,38 +76,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Resolve next image tag
-        //    Reads current sit#### from values-dev.yaml
-        //    and increments by 1 — keeps cert pipeline
-        //    and CApp pipeline in the same sequence.
-        // ─────────────────────────────────────────────
-        stage('Resolve Image Tag') {
-            when { environment name: 'CERT_FOUND', value: 'true' }
-            steps {
-                script {
-                    def currentTag = sh(
-                        script: "grep 'tag:' ${VALUES_FILE} | sed 's/.*tag: *//' | tr -d ' '",
-                        returnStdout: true
-                    ).trim()
-
-                    echo "Current tag in values-dev.yaml: ${currentTag}"
-
-                    // Extract number from sit#### and increment
-                    def currentNum = currentTag.replaceAll(/[^0-9]/, '').toInteger()
-                    def nextNum    = currentNum + 1
-                    def nextTag    = String.format("sit%04d", nextNum)
-
-                    env.IMAGE_TAG  = nextTag
-                    env.FULL_IMAGE = "${env.IMAGE_NAME}:${nextTag}"
-
-                    echo "New image tag: ${env.FULL_IMAGE}"
-                    currentBuild.description = "Cert update — ${env.FULL_IMAGE}"
-                }
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 4. Backup existing truststore (for rollback)
+        // 3. Backup existing truststore
         // ─────────────────────────────────────────────
         stage('Backup Truststore') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -150,7 +101,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 5. Import new certificates into truststore
+        // 4. Import new certificates into truststore
         // ─────────────────────────────────────────────
         stage('Import Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -161,7 +112,6 @@ pipeline {
 
                 TRUSTSTORE_PATH="${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
 
-                # Create truststore if it does not yet exist
                 if [ ! -f "$TRUSTSTORE_PATH" ]; then
                     echo "Truststore not found — creating a fresh one..."
                     keytool -genkeypair \
@@ -178,7 +128,6 @@ pipeline {
                     echo "Empty truststore created."
                 fi
 
-                # Import every new cert found in workspace root
                 find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
                     echo "--- Importing: $CERT  →  alias: $ALIAS ---"
@@ -191,7 +140,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 6. Verify truststore contents
+        // 5. Verify truststore contents
         // ─────────────────────────────────────────────
         stage('Verify Truststore') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -206,83 +155,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 7. Docker Build — new image with updated
-        //    truststore baked in (mirrors CApp pipeline)
-        // ─────────────────────────────────────────────
-        stage('Docker Build') {
-            when { environment name: 'CERT_FOUND', value: 'true' }
-            steps {
-                sh '''
-                echo "=== Pre-build context check ==="
-
-                # Truststore check
-                if [ ! -f "${DOCKER_PROJECT_PATH}/${TRUSTSTORE}" ]; then
-                    echo "ERROR: Truststore not found at ${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
-                    exit 1
-                fi
-                echo "Truststore : OK — $(ls -lh ${DOCKER_PROJECT_PATH}/${TRUSTSTORE})"
-
-                # CApp check — Dockerfile has COPY capps/*.car, must not be empty
-                CAR_COUNT=$(find ${CAPP_DEST_DIR} -name "*.car" -type f 2>/dev/null | wc -l)
-                if [ "$CAR_COUNT" -eq 0 ]; then
-                    echo "ERROR: No .car files found in ${CAPP_DEST_DIR}/"
-                    echo "       Run the CApp pipeline at least once before the cert pipeline."
-                    exit 1
-                fi
-                echo "CApps      : OK — ${CAR_COUNT} .car file(s) in capps/"
-                ls -lh ${CAPP_DEST_DIR}/
-
-                echo "=== Building Docker image: ${FULL_IMAGE} ==="
-                cd ${DOCKER_PROJECT_PATH}
-                docker build \
-                    --no-cache \
-                    -t ${FULL_IMAGE} \
-                    .
-
-                echo "=== Image built successfully ==="
-                docker images | grep ${IMAGE_NAME}
-                '''
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 8. Load image into Kind (mirrors CApp pipeline)
-        // ─────────────────────────────────────────────
-        stage('Load Image into Kind') {
-            when { environment name: 'CERT_FOUND', value: 'true' }
-            steps {
-                sh '''
-                echo "=== Loading ${FULL_IMAGE} into kind cluster: ${KIND_CLUSTER} ==="
-                kind load docker-image ${FULL_IMAGE} --name ${KIND_CLUSTER}
-
-                echo "=== All mi-sit images in kind ==="
-                docker exec ${KIND_CLUSTER}-control-plane crictl images | grep ${IMAGE_NAME}
-                '''
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 9. Update values-dev.yaml with new tag
-        //    (mirrors CApp pipeline exactly)
-        // ─────────────────────────────────────────────
-        stage('Update values-dev.yaml') {
-            when { environment name: 'CERT_FOUND', value: 'true' }
-            steps {
-                sh '''
-                echo "=== Updating image section in values-dev.yaml ==="
-
-                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"  ${VALUES_FILE}
-                sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                 ${VALUES_FILE}
-                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"   ${VALUES_FILE}
-
-                echo "=== Current image section in values-dev.yaml ==="
-                grep -A 3 "^image:" ${VALUES_FILE}
-                '''
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 10. Update Kubernetes ConfigMap
+        // 6. Update Kubernetes ConfigMap
         // ─────────────────────────────────────────────
         stage('Update Kubernetes ConfigMap') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -305,33 +178,25 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 11. Helm deploy + rollout (mirrors CApp pipeline)
+        // 7. Restart pods to pick up new truststore
         // ─────────────────────────────────────────────
-        stage('Helm Deploy') {
+        stage('Restart Deployment') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Deploying to namespace: ${K8S_NAMESPACE} ==="
-                helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
-                    -f ${VALUES_FILE} \
-                    -n ${K8S_NAMESPACE} \
-                    --timeout 3m0s
-
-                echo "=== Forcing pod restart to use new image + truststore ==="
+                echo "=== Restarting MI deployment ==="
                 kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
 
                 echo "=== Waiting for rollout ==="
                 kubectl rollout status deployment/mi-deployment \
                     -n ${K8S_NAMESPACE} \
                     --timeout=120s
-
-                helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 12. Verify deployment (mirrors CApp pipeline)
+        // 8. Verify deployment
         // ─────────────────────────────────────────────
         stage('Verify Deployment') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -340,19 +205,19 @@ pipeline {
                 echo "=== Pod status ==="
                 kubectl get pods -n ${K8S_NAMESPACE} -o wide
 
-                echo "=== Image running in pods ==="
+                echo "=== Image running (unchanged — cert update only) ==="
                 kubectl get pods -n ${K8S_NAMESPACE} \
                     -o jsonpath="{.items[*].spec.containers[*].image}" \
                     | tr " " "\\n"
 
-                echo "=== ConfigMap mounted check ==="
+                echo "=== ConfigMap check ==="
                 kubectl describe configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 13. Health check (mirrors CApp pipeline)
+        // 9. Health check
         // ─────────────────────────────────────────────
         stage('Health Check') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -370,36 +235,78 @@ pipeline {
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     curl -sf http://localhost:9164/management/apis \
                     -H "Authorization: Basic YWRtaW46YWRtaW4=" \
-                    && echo "Management API reachable — image + truststore confirmed" \
+                    && echo "Management API reachable — new truststore active" \
                     || echo "Management API not reachable — MI may still be starting"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 14. Archive processed certs out of workspace
+        // 10. Archive Certificates — git commit + push
+        //
+        //     WHY GIT COMMIT:
+        //     Simply moving files in the Jenkins workspace is
+        //     not enough — the next git checkout brings the
+        //     .crt files straight back from the repo root.
+        //     We git mv the files into certificates/ and push
+        //     so they permanently leave the repo root.
+        //     Next checkout: only certificates/ has them,
+        //     workspace root is clean → cert check finds
+        //     nothing → pipeline skips cleanly.
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Moving processed certificates to certificates/ ==="
-                CERT_DEST="${DOCKER_PROJECT_PATH}/certificates"
-                mkdir -p "$CERT_DEST"
+                echo "=== Archiving processed certificates into certificates/ ==="
 
-                find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) \
-                    -exec mv -f {} "$CERT_DEST/" \\;
+                # Ensure archive folder exists and is tracked by git
+                mkdir -p certificates
 
-                echo "=== Archived certificates ==="
-                ls -lh "$CERT_DEST/"
+                # Count certs to move
+                CERT_COUNT=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
+                echo "Certificates to archive: $CERT_COUNT"
+
+                if [ "$CERT_COUNT" -eq 0 ]; then
+                    echo "No certificates found to archive — skipping."
+                    exit 0
+                fi
+
+                # Configure git identity for the commit
+                git config user.email "jenkins@wso2-mi-cicd"
+                git config user.name "Jenkins CI"
+
+                # Move each cert from repo root → certificates/
+                find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
+                    FILENAME=$(basename "$CERT")
+                    echo "  Archiving: $FILENAME → certificates/$FILENAME"
+                    git mv "$FILENAME" "certificates/$FILENAME"
+                done
+
+                # Show what will be committed
+                echo "=== Git status before commit ==="
+                git status
+
+                # Commit the move
+                git commit -m "[Jenkins] Archive deployed certificates — Build #${BUILD_NUMBER}
+
+Certificates moved to certificates/ after successful import:
+$(git diff --cached --name-only | grep certificates/)
+
+Deployment: ConfigMap ${CONFIGMAP_NAME} updated, namespace ${K8S_NAMESPACE}
+Build: #${BUILD_NUMBER}"
+
+                # Push back to main — uses the same SSH key as checkout
+                git push origin main
+
+                echo "=== Certificates archived and committed to repo ==="
+                echo "=== certificates/ contents ==="
+                ls -lh certificates/
                 '''
             }
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Post actions (mirrors CApp pipeline)
-    // ─────────────────────────────────────────────
     post {
         success {
             script {
@@ -408,29 +315,19 @@ pipeline {
 ╔══════════════════════════════════════════════════════╗
 ║        Certificate Deployment SUCCESS                ║
 ╠══════════════════════════════════════════════════════╣
-║  Image       : ${env.FULL_IMAGE}
 ║  Truststore  : ${TRUSTSTORE}
 ║  ConfigMap   : ${CONFIGMAP_NAME}
 ║  Namespace   : ${K8S_NAMESPACE}
 ║  Build       : #${BUILD_NUMBER}
+║  Certs archived to certificates/ and committed to repo
 ╠══════════════════════════════════════════════════════╣
 ║  ROLLBACK STEPS:                                     ║
-║                                                      ║
-║  -- Image rollback --                                ║
-║  1. sed -i "s|tag:.*|tag: sit####|" ${VALUES_FILE}
-║  2. helm upgrade mi ${HELM_CHART_PATH} \\
-║        -f ${VALUES_FILE} -n ${K8S_NAMESPACE}
-║  3. kubectl rollout restart deployment/mi-deployment \\
-║        -n ${K8S_NAMESPACE}
-║                                                      ║
-║  -- Truststore rollback --                           ║
 ║  1. ls -lht ${TRUSTSTORE_BACKUP_DIR}/
-║  2. kubectl delete configmap ${CONFIGMAP_NAME} \\
-║        -n ${K8S_NAMESPACE}
+║  2. kubectl delete configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
 ║  3. kubectl create configmap ${CONFIGMAP_NAME} \\
-║        --from-file=<backup.jks> -n ${K8S_NAMESPACE}
+║         --from-file=<backup.jks> -n ${K8S_NAMESPACE}
 ║  4. kubectl rollout restart deployment/mi-deployment \\
-║        -n ${K8S_NAMESPACE}
+║         -n ${K8S_NAMESPACE}
 ╚══════════════════════════════════════════════════════╝
                     """
                 } else {
@@ -444,23 +341,10 @@ pipeline {
             kubectl get pods -n ${K8S_NAMESPACE} || true
             kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -40 || true
 
-            echo "=== Helm status ==="
-            helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE} || true
-
-            echo "=== Truststore backups available for manual rollback ==="
+            echo "=== Truststore backups for manual rollback ==="
             ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -5 || true
-            '''
-        }
-        cleanup {
-            sh '''
-            echo "=== Pruning old local images (keep last 3) ==="
-            docker images ${IMAGE_NAME} \
-                --format "{{.Tag}}" \
-                | grep "^sit" \
-                | sort -t t -k2 -n \
-                | head -n -3 \
-                | xargs -I{} docker rmi ${IMAGE_NAME}:{} || true
             '''
         }
     }
 }
+
