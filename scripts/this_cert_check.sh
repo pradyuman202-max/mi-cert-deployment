@@ -3,38 +3,58 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # this_cert_check.sh
 #
-# Checks whether any .crt / .cer in the workspace root is GENUINELY NEW —
-# i.e. its derived alias does NOT already exist in the truststore.
+# Scans the certificates/ folder in the repo (NOT the repo root) for new
+# .crt / .cer files whose alias does NOT yet exist in the truststore.
 #
-# This prevents re-triggering the pipeline for certs already imported but
-# still sitting in the repo from a previous commit.
+# Workflow:
+#   1. prady commits .crt file into certificates/ folder in GitHub repo
+#   2. Jenkins checks out repo → certificates/ appears in workspace
+#   3. This script scans certificates/ for new aliases not in truststore
+#   4. Pipeline proceeds if new cert found, skips if all already imported
+#   5. After deployment, certs are git mv'd to certificates/deployed/
+#      and pushed back to GitHub so next checkout does not re-trigger
 #
 # Usage  : this_cert_check.sh <truststore_path> <truststore_password>
-# Returns: 0 = at least one NEW cert found  → pipeline should proceed
-#          1 = all certs already imported OR no certs found → skip
+# Scans  : ./certificates/   (relative to Jenkins workspace)
+# Skips  : ./certificates/deployed/  (already processed)
+# Returns: 0 = at least one NEW cert found  → pipeline proceeds
+#          1 = all already imported OR none found → pipeline skips
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRUSTSTORE="$1"
 TRUSTSTORE_PASS="$2"
+
+# Always scan the certificates/ subfolder — never the repo root
+CERT_DIR="./certificates"
 
 if [ -z "$TRUSTSTORE" ] || [ -z "$TRUSTSTORE_PASS" ]; then
     echo "Usage: $0 <truststore_path> <truststore_password>"
     exit 1
 fi
 
-echo "Scanning workspace root for certificate files..."
-CERT_FILES=$(find . -maxdepth 1 -type f \( -name "*.crt" -o -name "*.cer" \))
-
-if [ -z "$CERT_FILES" ]; then
-    echo "No certificate files found in workspace root."
+if [ ! -d "$CERT_DIR" ]; then
+    echo "certificates/ folder not found in workspace. No certs to process."
     exit 1
 fi
 
-echo "Found certificate file(s):"
+echo "Scanning for certificate files in: $CERT_DIR"
+echo "(Skipping deployed/ subfolder — those are already processed)"
+echo ""
+
+# Find certs in certificates/ but NOT in certificates/deployed/
+CERT_FILES=$(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.cer" \))
+
+if [ -z "$CERT_FILES" ]; then
+    echo "No certificate files found in certificates/ folder."
+    echo "To deploy a cert: commit your .crt file to the certificates/ folder in GitHub."
+    exit 1
+fi
+
+echo "Found certificate file(s) in certificates/:"
 echo "$CERT_FILES"
 echo ""
 
-# If truststore does not exist yet, every cert is new by definition
+# If truststore does not exist yet — all certs are new
 if [ ! -f "$TRUSTSTORE" ]; then
     echo "Truststore not found — treating all certs as new."
     exit 0
@@ -69,3 +89,4 @@ else
     echo "Result: All certificate(s) already imported — pipeline will skip."
     exit 1
 fi
+

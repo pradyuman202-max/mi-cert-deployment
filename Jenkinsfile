@@ -6,6 +6,12 @@ pipeline {
         DOCKER_PROJECT_PATH   = "/home/svc_account_wso2/SIT_MI_Docker_Project"
         CAPP_DEST_DIR         = "${DOCKER_PROJECT_PATH}/capps"
 
+        // --- Cert folder in repo ---
+        // Certs committed here in GitHub → pipeline reads from here
+        // After deploy → moved to certificates/deployed/ and pushed back
+        CERT_INCOMING_DIR     = "certificates"
+        CERT_DEPLOYED_DIR     = "certificates/deployed"
+
         // --- Truststore ---
         TRUSTSTORE            = "client-truststore.jks"
         TRUSTSTORE_PASS       = "wso2carbon"
@@ -44,14 +50,11 @@ pipeline {
                 echo "=== Workspace root ==="
                 ls -l
 
-                echo "=== Scripts ==="
-                ls -l scripts/
+                echo "=== certificates/ folder (drop new certs here in GitHub) ==="
+                ls -lh ${CERT_INCOMING_DIR}/ 2>/dev/null || echo "certificates/ folder is empty or missing"
 
-                echo "=== Certificate files in workspace root ==="
-                find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) || echo "None found"
-
-                echo "=== Already archived certificates ==="
-                ls -lh certificates/ 2>/dev/null || echo "certificates/ is empty or missing"
+                echo "=== certificates/deployed/ folder (already processed) ==="
+                ls -lh ${CERT_DEPLOYED_DIR}/ 2>/dev/null || echo "certificates/deployed/ is empty"
 
                 echo "=== CApps available in build context ==="
                 ls -lh ${CAPP_DEST_DIR}/ || echo "WARNING: capps/ is empty or missing"
@@ -63,7 +66,9 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 2. Certificate check — alias-based detection
+        // 2. Certificate check
+        //    Scans certificates/ folder (NOT repo root)
+        //    Checks each alias against truststore.
         //    Runs ONCE. Sets CERT_FOUND flag.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
@@ -80,11 +85,11 @@ pipeline {
                     )
 
                     if (certCheck != 0) {
-                        echo "No new certificates detected. All downstream stages will be skipped."
+                        echo "No new certificates found in certificates/ folder. All downstream stages skipped."
                         currentBuild.description = "Skipped — no new certificate"
                         env.CERT_FOUND = "false"
                     } else {
-                        echo "New certificate(s) detected. Proceeding with full deployment."
+                        echo "New certificate(s) found in certificates/. Proceeding with full deployment."
                         env.CERT_FOUND = "true"
                     }
                 }
@@ -92,22 +97,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Resolve next image tag
-        //
-        //    TAG COLLISION FIX:
-        //    Reads current tag from values-dev.yaml and
-        //    increments by +1. Then checks if that new
-        //    tag ALREADY EXISTS locally (from a previous
-        //    failed build). If it does → deletes it first
-        //    so docker build starts clean every time.
-        //
-        //    This prevents the scenario:
-        //    Build N  → builds sit0018 → helm fails
-        //               → values-dev.yaml still sit0017
-        //    Build N+1 → resolves sit0018 again
-        //               → sit0018 exists locally → ERROR
-        //    Fix: detect and remove stale sit0018 before
-        //    building fresh.
+        // 3. Resolve next image tag + collision check
         // ─────────────────────────────────────────────
         stage('Resolve Image Tag') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -131,17 +121,15 @@ pipeline {
                     currentBuild.description = "Cert update — ${env.FULL_IMAGE}"
 
                     // ── TAG COLLISION CHECK ──────────────────────────
-                    // If this exact tag already exists locally, it means
-                    // a previous build created it but failed before
-                    // updating values-dev.yaml. Remove the stale image
-                    // so we always build fresh with a clean layer cache.
+                    // If this tag already exists locally from a previous
+                    // failed build, remove it so we always build fresh.
                     def tagExists = sh(
                         script: "docker images ${env.IMAGE_NAME} --format '{{.Tag}}' | grep -x '${nextTag}' || true",
                         returnStdout: true
                     ).trim()
 
                     if (tagExists) {
-                        echo "WARNING: Tag ${env.FULL_IMAGE} already exists locally from a previous failed build."
+                        echo "WARNING: Tag ${env.FULL_IMAGE} already exists from a previous failed build."
                         echo "Removing stale image before rebuilding..."
                         sh "docker rmi ${env.FULL_IMAGE} || true"
                         echo "Stale image removed. Will build fresh."
@@ -168,23 +156,22 @@ pipeline {
                 if [ -f "$TRUSTSTORE_PATH" ]; then
                     cp "$TRUSTSTORE_PATH" "$BACKUP_FILE"
                     echo "Backup saved: $BACKUP_FILE"
-                    echo "=== Existing backups (latest first) ==="
                     ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -10
                 else
-                    echo "No existing truststore found — skipping backup."
+                    echo "No existing truststore — skipping backup."
                 fi
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 5. Import new certificates into truststore
+        // 5. Import certificates from certificates/ folder
         // ─────────────────────────────────────────────
         stage('Import Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Starting certificate import ==="
+                echo "=== Starting certificate import from ${CERT_INCOMING_DIR}/ ==="
                 chmod +x scripts/import-cert.sh
 
                 TRUSTSTORE_PATH="${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
@@ -205,7 +192,8 @@ pipeline {
                     echo "Empty truststore created."
                 fi
 
-                find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
+                # Import only from certificates/ root — not from deployed/ subfolder
+                find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
                     echo "--- Importing: $CERT  →  alias: $ALIAS ---"
                     ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE_PATH" "${TRUSTSTORE_PASS}" "$ALIAS"
@@ -232,8 +220,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 7. Docker Build — new image with updated
-        //    truststore baked in (mirrors CApp pipeline)
+        // 7. Docker Build
         // ─────────────────────────────────────────────
         stage('Docker Build') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -241,21 +228,18 @@ pipeline {
                 sh '''
                 echo "=== Pre-build context check ==="
 
-                # Truststore check
                 if [ ! -f "${DOCKER_PROJECT_PATH}/${TRUSTSTORE}" ]; then
-                    echo "ERROR: Truststore not found at ${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
+                    echo "ERROR: Truststore not found."
                     exit 1
                 fi
                 echo "Truststore : OK — $(ls -lh ${DOCKER_PROJECT_PATH}/${TRUSTSTORE})"
 
-                # CApp check — Dockerfile has COPY capps/*.car so capps/ must not be empty
                 CAR_COUNT=$(find ${CAPP_DEST_DIR} -name "*.car" -type f 2>/dev/null | wc -l)
                 if [ "$CAR_COUNT" -eq 0 ]; then
-                    echo "ERROR: No .car files found in ${CAPP_DEST_DIR}/"
-                    echo "       Run the CApp pipeline at least once before the cert pipeline."
+                    echo "ERROR: No .car files in ${CAPP_DEST_DIR}/. Run CApp pipeline first."
                     exit 1
                 fi
-                echo "CApps      : OK — ${CAR_COUNT} .car file(s) in capps/"
+                echo "CApps      : OK — ${CAR_COUNT} .car file(s)"
 
                 echo "=== Building Docker image: ${FULL_IMAGE} ==="
                 cd ${DOCKER_PROJECT_PATH}
@@ -271,7 +255,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 8. Load image into Kind (mirrors CApp pipeline)
+        // 8. Load image into Kind
         // ─────────────────────────────────────────────
         stage('Load Image into Kind') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -287,10 +271,8 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 9. Update values-dev.yaml with new tag
-        //    Done AFTER successful docker build + kind
-        //    load so that if build fails, values-dev.yaml
-        //    still holds the last GOOD tag for next run.
+        // 9. Update values-dev.yaml
+        //    Done AFTER successful build + kind load.
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -302,7 +284,7 @@ pipeline {
                 sed -i "s|tag:.*|tag: ${IMAGE_TAG}|"                 ${VALUES_FILE}
                 sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"   ${VALUES_FILE}
 
-                echo "=== Current image section in values-dev.yaml ==="
+                echo "=== Current image section ==="
                 grep -A 3 "^image:" ${VALUES_FILE}
                 '''
             }
@@ -332,7 +314,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 11. Helm deploy + rollout (mirrors CApp pipeline)
+        // 11. Helm deploy + rollout
         // ─────────────────────────────────────────────
         stage('Helm Deploy') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -358,7 +340,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 12. Verify deployment (mirrors CApp pipeline)
+        // 12. Verify deployment
         // ─────────────────────────────────────────────
         stage('Verify Deployment') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -379,7 +361,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 13. Health check (mirrors CApp pipeline)
+        // 13. Health check
         // ─────────────────────────────────────────────
         stage('Health Check') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -404,37 +386,40 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 14. Archive Certificates — git mv + commit
+        // 14. Archive Certificates
         //
-        //     Moves .crt/.cer files from repo root into
-        //     certificates/ AND commits+pushes to GitHub.
-        //     This permanently removes them from repo root
-        //     so next checkout never brings them back.
-        //     Next run: workspace root is clean →
-        //     cert check finds nothing → pipeline skips.
+        //     git mv certificates/*.crt → certificates/deployed/
+        //     and push back to GitHub.
+        //
+        //     Next checkout: certs are in deployed/ subfolder,
+        //     NOT in certificates/ root. Script uses -maxdepth 1
+        //     so it never scans deployed/ → pipeline skips cleanly.
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Archiving processed certificates into certificates/ ==="
-                mkdir -p certificates
+                echo "=== Archiving deployed certificates to ${CERT_DEPLOYED_DIR}/ ==="
 
-                CERT_COUNT=$(find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
+                # Ensure deployed/ subfolder exists and is tracked by git
+                mkdir -p ${CERT_DEPLOYED_DIR}
+
+                CERT_COUNT=$(find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
                 echo "Certificates to archive: $CERT_COUNT"
 
                 if [ "$CERT_COUNT" -eq 0 ]; then
-                    echo "No certificates found to archive — skipping."
+                    echo "No certificates to archive."
                     exit 0
                 fi
 
                 git config user.email "jenkins@wso2-mi-cicd"
                 git config user.name "Jenkins CI"
 
-                find . -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
+                # Move each cert from certificates/ → certificates/deployed/
+                find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     FILENAME=$(basename "$CERT")
-                    echo "  Archiving: $FILENAME → certificates/$FILENAME"
-                    git mv "$FILENAME" "certificates/$FILENAME"
+                    echo "  Moving: certificates/$FILENAME → ${CERT_DEPLOYED_DIR}/$FILENAME"
+                    git mv "certificates/$FILENAME" "${CERT_DEPLOYED_DIR}/$FILENAME"
                 done
 
                 echo "=== Git status before commit ==="
@@ -442,23 +427,21 @@ pipeline {
 
                 git commit -m "[Jenkins] Archive deployed certificates — Build #${BUILD_NUMBER}
 
-Certificates moved to certificates/ after successful deployment.
+Certificates moved: certificates/ → certificates/deployed/
 Image deployed: ${FULL_IMAGE}
 Namespace: ${K8S_NAMESPACE}
 Build: #${BUILD_NUMBER}"
 
                 git push origin main
 
-                echo "=== Certificates committed and pushed to repo ==="
-                ls -lh certificates/
+                echo "=== Certificates archived to ${CERT_DEPLOYED_DIR}/ and pushed to GitHub ==="
+                echo "=== Next pipeline run will find certificates/ empty → will skip cleanly ==="
+                ls -lh ${CERT_DEPLOYED_DIR}/
                 '''
             }
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Post actions (mirrors CApp pipeline)
-    // ─────────────────────────────────────────────
     post {
         success {
             script {
@@ -472,7 +455,7 @@ Build: #${BUILD_NUMBER}"
 ║  ConfigMap   : ${CONFIGMAP_NAME}
 ║  Namespace   : ${K8S_NAMESPACE}
 ║  Build       : #${BUILD_NUMBER}
-║  Certs archived and committed to repo
+║  Certs moved : certificates/ → certificates/deployed/
 ╠══════════════════════════════════════════════════════╣
 ║  ROLLBACK STEPS:                                     ║
 ║                                                      ║
@@ -494,7 +477,7 @@ Build: #${BUILD_NUMBER}"
 ╚══════════════════════════════════════════════════════╝
                     """
                 } else {
-                    echo "Pipeline completed — no new certificates detected, all stages skipped cleanly."
+                    echo "Pipeline completed — no new certificates in certificates/ folder, all stages skipped cleanly."
                 }
             }
         }
@@ -503,15 +486,12 @@ Build: #${BUILD_NUMBER}"
             echo "=== FAILURE DIAGNOSTICS ==="
             kubectl get pods -n ${K8S_NAMESPACE} || true
             kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -40 || true
-
-            echo "=== Helm status ==="
             helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE} || true
 
             echo "=== Truststore backups for manual rollback ==="
             ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -5 || true
 
-            echo "=== NOTE: values-dev.yaml was only updated AFTER successful docker build ==="
-            echo "=== If build failed before that stage, tag is still the previous good tag ==="
+            echo "=== Current tag in values-dev.yaml ==="
             grep "tag:" ${VALUES_FILE} || true
             '''
         }
