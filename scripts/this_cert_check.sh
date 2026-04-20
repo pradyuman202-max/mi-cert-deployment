@@ -3,23 +3,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # this_cert_check.sh
 #
-# Simple alias check — no tiers, no complexity.
-#
-# For each .crt / .cer in certificates/ folder:
+# Simple alias check for each .crt / .cer in certificates/ folder.
+# For each cert:
 #   → derive alias from filename
-#   → check if alias exists in truststore via keytool
-#   → NEW  = not in truststore → pipeline proceeds
-#   → OLD  = already in truststore → skip this cert
+#   → check if alias exists in truststore
+#   → NEW  → pipeline proceeds
+#   → OLD  → skip this cert
 #
 # If ANY new cert found → exit 0 → pipeline deploys
-# If ALL certs already imported OR no certs → exit 1 → pipeline skips
+# If ALL already imported OR no certs → exit 1 → pipeline skips
 #
-# After deployment the pipeline moves ALL certs to certificates/deployed/
-# on the server. Next run: certificates/ is empty → exit 1 → skip cleanly.
-# No need for keytool checks at all on subsequent runs.
-#
-# Usage  : this_cert_check.sh <truststore_path> <truststore_password>
-# Scans  : ./certificates/  (Jenkins workspace, -maxdepth 1 only)
+# Usage: this_cert_check.sh <truststore_path> <truststore_password>
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRUSTSTORE="$1"
@@ -31,9 +25,8 @@ if [ -z "$TRUSTSTORE" ] || [ -z "$TRUSTSTORE_PASS" ]; then
     exit 1
 fi
 
-# ── Scan certificates/ folder ────────────────────────────────────────────────
 if [ ! -d "$CERT_DIR" ]; then
-    echo "certificates/ folder not found in workspace. No certs to process."
+    echo "certificates/ folder not found in workspace."
     exit 1
 fi
 
@@ -51,13 +44,11 @@ echo "Found certificate(s):"
 echo "$CERT_FILES"
 echo ""
 
-# ── If truststore missing → all certs are new ────────────────────────────────
 if [ ! -f "$TRUSTSTORE" ]; then
     echo "Truststore not found — all certs treated as new."
     exit 0
 fi
 
-# ── Check each cert alias against truststore ─────────────────────────────────
 echo "Checking aliases against truststore: $TRUSTSTORE"
 echo "────────────────────────────────────────────────────────"
 
@@ -66,16 +57,17 @@ NEW_CERT_FOUND=0
 while IFS= read -r CERT; do
     ALIAS=$(basename "$CERT" | cut -d. -f1)
 
+    # ── FIX: grep -ic returns exit code 1 when count=0 ──────────────────────
+    # Without || echo "0", the subshell exits with code 1 when a new cert is
+    # found, crashing the entire loop before NEW_CERT_FOUND can be checked.
     EXISTS=$(keytool -list \
         -keystore "$TRUSTSTORE" \
         -storepass "$TRUSTSTORE_PASS" \
-        2>/dev/null | grep -ic "^${ALIAS},")
+        2>/dev/null | grep -ic "^${ALIAS}," || echo "0")
 
     if [ "$EXISTS" -eq 0 ]; then
         echo "NEW     : $CERT  (alias: $ALIAS — not in truststore)"
         NEW_CERT_FOUND=1
-        # NOTE: do NOT reset to 0 after this — keep scanning for more new certs
-        # but result is already decided: pipeline will proceed
     else
         echo "EXISTING: $CERT  (alias: $ALIAS — already imported)"
     fi

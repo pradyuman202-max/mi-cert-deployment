@@ -7,11 +7,6 @@ pipeline {
         CAPP_DEST_DIR             = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Cert folders ---
-        // New certs: committed to certificates/ in GitHub repo
-        // After deploy: moved to certificates/deployed/ on SERVER
-        //   → next checkout brings certs back to workspace certificates/
-        //   → but cert check finds all aliases already in truststore → skip
-        //   → AND server deployed folder is populated → no re-import
         CERT_INCOMING_DIR         = "certificates"
         SERVER_CERT_DEPLOYED_DIR  = "${DOCKER_PROJECT_PATH}/certificates/deployed"
 
@@ -70,14 +65,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 2. Certificate Check
-        //
         //    Simple alias check — no tiers.
-        //    For each .crt in certificates/:
-        //      → check alias against truststore
-        //      → NEW  → deploy
-        //      → OLD  → skip
-        //    If ANY new → CERT_FOUND=true → all stages run
-        //    If ALL old → CERT_FOUND=false → all stages skip
+        //    Runs ONCE. Sets CERT_FOUND flag.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
             steps {
@@ -128,14 +117,13 @@ pipeline {
                     echo "New image tag: ${env.FULL_IMAGE}"
                     currentBuild.description = "Cert update — ${env.FULL_IMAGE}"
 
-                    // Tag collision check
                     def tagExists = sh(
                         script: "docker images ${env.IMAGE_NAME} --format '{{.Tag}}' | grep -x '${nextTag}' || true",
                         returnStdout: true
                     ).trim()
 
                     if (tagExists) {
-                        echo "WARNING: Tag ${env.FULL_IMAGE} exists from previous failed build — removing stale image."
+                        echo "WARNING: Tag ${env.FULL_IMAGE} exists from previous failed build — removing."
                         sh "docker rmi ${env.FULL_IMAGE} || true"
                     } else {
                         echo "Tag ${env.FULL_IMAGE} is clean."
@@ -170,8 +158,15 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 5. Import ONLY NEW certificates
-        //    Existing truststore kept as-is.
-        //    Only new aliases added incrementally.
+        //
+        //    KEY FIX: grep -ic returns exit code 1 when
+        //    count=0 (no match). Without "|| echo 0",
+        //    the subshell exits with code 1 the moment a
+        //    NEW cert is found, crashing the loop before
+        //    import-cert.sh can run.
+        //    Fix: "grep -ic ... || echo 0" ensures the
+        //    command always succeeds and EXISTS is always
+        //    a valid number.
         // ─────────────────────────────────────────────
         stage('Import New Certificates Only') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -201,10 +196,12 @@ pipeline {
                 find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
 
+                    # FIX: || echo "0" prevents grep exit code 1 (no match)
+                    # from crashing the while loop
                     EXISTS=$(keytool -list \
                         -keystore "$TRUSTSTORE_PATH" \
                         -storepass ${TRUSTSTORE_PASS} \
-                        2>/dev/null | grep -ic "^${ALIAS},")
+                        2>/dev/null | grep -ic "^${ALIAS}," || echo "0")
 
                     if [ "$EXISTS" -gt 0 ]; then
                         echo "SKIP   : $CERT  (alias '$ALIAS' already in truststore)"
@@ -406,24 +403,16 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 14. Move ALL certs to server deployed folder
-        //
-        //     Copies ALL certs from workspace certificates/
-        //     to SERVER: /home/.../certificates/deployed/
-        //
-        //     Why ALL (not just new ones):
-        //     Next pipeline run — certificates/ in workspace
-        //     will have ALL certs again (from git checkout).
-        //     Cert check will run keytool for each one.
-        //     By copying ALL to deployed/ on server, if we
-        //     ever add a fast-check back, it works correctly.
-        //     More importantly — this is the definitive record
-        //     of what has been deployed to this environment.
+        //     After successful deployment, copy every
+        //     cert from workspace certificates/ to the
+        //     server deployed folder so they are recorded
+        //     as deployed.
         // ─────────────────────────────────────────────
         stage('Move Certs to Deployed Folder') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Moving all certs to server deployed folder ==="
+                echo "=== Copying all certs to server deployed folder ==="
                 echo "=== Location: ${SERVER_CERT_DEPLOYED_DIR} ==="
                 mkdir -p ${SERVER_CERT_DEPLOYED_DIR}
 
