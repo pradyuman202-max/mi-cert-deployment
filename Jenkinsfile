@@ -6,9 +6,9 @@ pipeline {
         DOCKER_PROJECT_PATH   = "/home/svc_account_wso2/SIT_MI_Docker_Project"
         CAPP_DEST_DIR         = "${DOCKER_PROJECT_PATH}/capps"
 
-        // --- Cert folder in repo ---
-        // Certs committed here in GitHub → pipeline reads from here
-        // After deploy → moved to certificates/deployed/ and pushed back
+        // --- Cert folders in repo ---
+        // Drop new certs into certificates/ in GitHub
+        // After deploy → moved to certificates/deployed/ (same filename, different folder)
         CERT_INCOMING_DIR     = "certificates"
         CERT_DEPLOYED_DIR     = "certificates/deployed"
 
@@ -51,7 +51,7 @@ pipeline {
                 ls -l
 
                 echo "=== certificates/ folder (drop new certs here in GitHub) ==="
-                ls -lh ${CERT_INCOMING_DIR}/ 2>/dev/null || echo "certificates/ folder is empty or missing"
+                ls -lh ${CERT_INCOMING_DIR}/ 2>/dev/null || echo "certificates/ is empty or missing"
 
                 echo "=== certificates/deployed/ folder (already processed) ==="
                 ls -lh ${CERT_DEPLOYED_DIR}/ 2>/dev/null || echo "certificates/deployed/ is empty"
@@ -66,9 +66,8 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 2. Certificate check
+        // 2. Certificate check — alias-based detection
         //    Scans certificates/ folder (NOT repo root)
-        //    Checks each alias against truststore.
         //    Runs ONCE. Sets CERT_FOUND flag.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
@@ -89,7 +88,7 @@ pipeline {
                         currentBuild.description = "Skipped — no new certificate"
                         env.CERT_FOUND = "false"
                     } else {
-                        echo "New certificate(s) found in certificates/. Proceeding with full deployment."
+                        echo "New certificate(s) found. Proceeding with full deployment."
                         env.CERT_FOUND = "true"
                     }
                 }
@@ -121,8 +120,6 @@ pipeline {
                     currentBuild.description = "Cert update — ${env.FULL_IMAGE}"
 
                     // ── TAG COLLISION CHECK ──────────────────────────
-                    // If this tag already exists locally from a previous
-                    // failed build, remove it so we always build fresh.
                     def tagExists = sh(
                         script: "docker images ${env.IMAGE_NAME} --format '{{.Tag}}' | grep -x '${nextTag}' || true",
                         returnStdout: true
@@ -192,7 +189,7 @@ pipeline {
                     echo "Empty truststore created."
                 fi
 
-                # Import only from certificates/ root — not from deployed/ subfolder
+                # Import only from certificates/ root — never from deployed/ subfolder
                 find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
                     echo "--- Importing: $CERT  →  alias: $ALIAS ---"
@@ -388,56 +385,63 @@ pipeline {
         // ─────────────────────────────────────────────
         // 14. Archive Certificates
         //
-        //     git mv certificates/*.crt → certificates/deployed/
-        //     and push back to GitHub.
+        //     Moves certs: certificates/ → certificates/deployed/
+        //     SAME filename, just different folder.
+        //     git mv + push so next checkout finds certificates/
+        //     empty → pipeline skips cleanly next run.
         //
-        //     Next checkout: certs are in deployed/ subfolder,
-        //     NOT in certificates/ root. Script uses -maxdepth 1
-        //     so it never scans deployed/ → pipeline skips cleanly.
+        //     Uses catchError so if git push fails (e.g. key
+        //     permission issue), the deployment is still marked
+        //     SUCCESS — certs are deployed, only archiving failed.
+        //     A warning is printed with the fix instructions.
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
-                sh '''
-                echo "=== Archiving deployed certificates to ${CERT_DEPLOYED_DIR}/ ==="
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh '''
+                    echo "=== Archiving deployed certificates to ${CERT_DEPLOYED_DIR}/ ==="
+                    echo "=== (Same filename kept — only folder changes) ==="
 
-                # Ensure deployed/ subfolder exists and is tracked by git
-                mkdir -p ${CERT_DEPLOYED_DIR}
+                    mkdir -p ${CERT_DEPLOYED_DIR}
 
-                CERT_COUNT=$(find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
-                echo "Certificates to archive: $CERT_COUNT"
+                    CERT_COUNT=$(find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
+                    echo "Certificates to archive: $CERT_COUNT"
 
-                if [ "$CERT_COUNT" -eq 0 ]; then
-                    echo "No certificates to archive."
-                    exit 0
-                fi
+                    if [ "$CERT_COUNT" -eq 0 ]; then
+                        echo "No certificates to archive."
+                        exit 0
+                    fi
 
-                git config user.email "jenkins@wso2-mi-cicd"
-                git config user.name "Jenkins CI"
+                    git config user.email "jenkins@wso2-mi-cicd"
+                    git config user.name "Jenkins CI"
 
-                # Move each cert from certificates/ → certificates/deployed/
-                find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
-                    FILENAME=$(basename "$CERT")
-                    echo "  Moving: certificates/$FILENAME → ${CERT_DEPLOYED_DIR}/$FILENAME"
-                    git mv "certificates/$FILENAME" "${CERT_DEPLOYED_DIR}/$FILENAME"
-                done
+                    # Move each cert: certificates/name.crt → certificates/deployed/name.crt
+                    # Filename stays EXACTLY the same — only the folder changes
+                    find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
+                        FILENAME=$(basename "$CERT")
+                        echo "  Moving: ${CERT_INCOMING_DIR}/$FILENAME → ${CERT_DEPLOYED_DIR}/$FILENAME"
+                        git mv "${CERT_INCOMING_DIR}/$FILENAME" "${CERT_DEPLOYED_DIR}/$FILENAME"
+                    done
 
-                echo "=== Git status before commit ==="
-                git status
+                    echo "=== Git status before commit ==="
+                    git status
 
-                git commit -m "[Jenkins] Archive deployed certificates — Build #${BUILD_NUMBER}
+                    git commit -m "[Jenkins] Archive deployed certificates — Build #${BUILD_NUMBER}
 
 Certificates moved: certificates/ → certificates/deployed/
+Same filenames kept — only folder changed.
 Image deployed: ${FULL_IMAGE}
 Namespace: ${K8S_NAMESPACE}
 Build: #${BUILD_NUMBER}"
 
-                git push origin main
+                    git push origin main
 
-                echo "=== Certificates archived to ${CERT_DEPLOYED_DIR}/ and pushed to GitHub ==="
-                echo "=== Next pipeline run will find certificates/ empty → will skip cleanly ==="
-                ls -lh ${CERT_DEPLOYED_DIR}/
-                '''
+                    echo "=== Certificates archived to ${CERT_DEPLOYED_DIR}/ and pushed to GitHub ==="
+                    echo "=== Next pipeline run: certificates/ is empty → will skip cleanly ==="
+                    ls -lh ${CERT_DEPLOYED_DIR}/
+                    '''
+                }
             }
         }
     }
@@ -455,21 +459,23 @@ Build: #${BUILD_NUMBER}"
 ║  ConfigMap   : ${CONFIGMAP_NAME}
 ║  Namespace   : ${K8S_NAMESPACE}
 ║  Build       : #${BUILD_NUMBER}
-║  Certs moved : certificates/ → certificates/deployed/
+╠══════════════════════════════════════════════════════╣
+║  If Archive stage shows UNSTABLE:                    ║
+║  → Deployment succeeded but git push failed          ║
+║  → Fix: GitHub repo → Settings → Deploy keys        ║
+║         → tick Allow write access → Save             ║
+║  → Then re-run pipeline OR manually move certs       ║
 ╠══════════════════════════════════════════════════════╣
 ║  ROLLBACK STEPS:                                     ║
-║                                                      ║
 ║  -- Image rollback --                                ║
 ║  1. sed -i "s|tag:.*|tag: sit####|" ${VALUES_FILE}
 ║  2. helm upgrade mi ${HELM_CHART_PATH} \\
 ║        -f ${VALUES_FILE} -n ${K8S_NAMESPACE}
 ║  3. kubectl rollout restart deployment/mi-deployment \\
 ║        -n ${K8S_NAMESPACE}
-║                                                      ║
 ║  -- Truststore rollback --                           ║
 ║  1. ls -lht ${TRUSTSTORE_BACKUP_DIR}/
-║  2. kubectl delete configmap ${CONFIGMAP_NAME} \\
-║        -n ${K8S_NAMESPACE}
+║  2. kubectl delete configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
 ║  3. kubectl create configmap ${CONFIGMAP_NAME} \\
 ║        --from-file=<backup.jks> -n ${K8S_NAMESPACE}
 ║  4. kubectl rollout restart deployment/mi-deployment \\
