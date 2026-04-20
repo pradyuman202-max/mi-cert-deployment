@@ -159,14 +159,12 @@ pipeline {
         // ─────────────────────────────────────────────
         // 5. Import ONLY NEW certificates
         //
-        //    KEY FIX: grep -ic returns exit code 1 when
-        //    count=0 (no match). Without "|| echo 0",
-        //    the subshell exits with code 1 the moment a
-        //    NEW cert is found, crashing the loop before
-        //    import-cert.sh can run.
-        //    Fix: "grep -ic ... || echo 0" ensures the
-        //    command always succeeds and EXISTS is always
-        //    a valid number.
+        //    KEY FIX: use grep -i | wc -l instead of grep -ic
+        //    grep -ic exits code 1 when count=0 AND outputs "0"
+        //    to stdout. With "|| echo 0", EXISTS becomes "0\n0"
+        //    (two lines) which breaks the integer check.
+        //    wc -l always exits code 0 and always returns a
+        //    clean single integer — no extra handling needed.
         // ─────────────────────────────────────────────
         stage('Import New Certificates Only') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -201,7 +199,7 @@ pipeline {
                     EXISTS=$(keytool -list \
                         -keystore "$TRUSTSTORE_PATH" \
                         -storepass ${TRUSTSTORE_PASS} \
-                        2>/dev/null | grep -ic "^${ALIAS}," || echo "0")
+                        2>/dev/null | grep -i "^${ALIAS}," | wc -l)
 
                     if [ "$EXISTS" -gt 0 ]; then
                         echo "SKIP   : $CERT  (alias '$ALIAS' already in truststore)"

@@ -57,13 +57,14 @@ NEW_CERT_FOUND=0
 while IFS= read -r CERT; do
     ALIAS=$(basename "$CERT" | cut -d. -f1)
 
-    # ── FIX: grep -ic returns exit code 1 when count=0 ──────────────────────
-    # Without || echo "0", the subshell exits with code 1 when a new cert is
-    # found, crashing the entire loop before NEW_CERT_FOUND can be checked.
+    # ── USE wc -l instead of grep -ic ────────────────────────────────────────
+    # grep -ic exits code 1 when count=0, AND still outputs "0" to stdout.
+    # With "|| echo 0", EXISTS becomes "0\n0" (two lines) → integer error.
+    # wc -l always exits code 0 and always outputs a clean integer.
     EXISTS=$(keytool -list \
         -keystore "$TRUSTSTORE" \
         -storepass "$TRUSTSTORE_PASS" \
-        2>/dev/null | grep -ic "^${ALIAS}," || echo "0")
+        2>/dev/null | grep -i "^${ALIAS}," | wc -l)
 
     if [ "$EXISTS" -eq 0 ]; then
         echo "NEW     : $CERT  (alias: $ALIAS — not in truststore)"
