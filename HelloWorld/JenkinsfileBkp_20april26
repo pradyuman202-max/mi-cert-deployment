@@ -10,8 +10,10 @@ pipeline {
         CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Docker ---
-        // IMAGE_TAG resolved dynamically in 'Resolve Image Tag' stage
         IMAGE_NAME          = "mi-sit"
+        // IMAGE_TAG is resolved dynamically in 'Resolve Image Tag' stage
+        // by reading current tag from values-dev.yaml and incrementing by 1.
+        // This keeps cert pipeline and CApp pipeline in the same sit#### sequence.
 
         // --- Kind cluster ---
         KIND_CLUSTER        = "wso2-cluster"
@@ -48,6 +50,9 @@ pipeline {
                 echo "=== All .car files found in HelloWorld/ ==="
                 find HelloWorld -name "*.car" -type f
 
+                CAR_COUNT=$(find HelloWorld -name "*.car" -type f | wc -l)
+                echo "Total .car files in workspace: ${CAR_COUNT}"
+
                 echo "=== Currently deployed .car files in capps/ ==="
                 ls -lh ${CAPP_DEST_DIR}/ || echo "capps/ is empty or missing"
 
@@ -59,8 +64,8 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 2. CApp change detection — runs ONCE
-        //    NEW file, UPDATED checksum, or DELETED file
-        //    Sets CAPP_CHANGED flag for all stages.
+        //    Checks for new files OR changed checksums.
+        //    Sets CAPP_CHANGED flag for all downstream stages.
         // ─────────────────────────────────────────────
         stage('CApp Change Check') {
             steps {
@@ -87,21 +92,9 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 3. Resolve next image tag
-        //
-        //    TAG COLLISION FIX:
-        //    Reads current tag from values-dev.yaml and
-        //    increments by +1. Then checks if that tag
-        //    already exists locally (left over from a
-        //    previous failed build). If it does → removes
-        //    it first so docker build always starts clean.
-        //
-        //    Scenario this fixes:
-        //    Build N  → builds sit0018 → helm fails
-        //               → values-dev.yaml still sit0017
-        //    Build N+1 → resolves sit0018 again
-        //               → sit0018 exists → collision ERROR
-        //    Fix: detect stale sit0018 → docker rmi it
-        //         → build fresh sit0018 cleanly.
+        //    Reads current sit#### from values-dev.yaml
+        //    and increments by 1. Shared sequence with
+        //    cert pipeline — never out of sync.
         // ─────────────────────────────────────────────
         stage('Resolve Image Tag') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -123,27 +116,12 @@ pipeline {
 
                     echo "New image tag: ${env.FULL_IMAGE}"
                     currentBuild.description = "CApp deploy — ${env.FULL_IMAGE}"
-
-                    // ── TAG COLLISION CHECK ──────────────────────────
-                    def tagExists = sh(
-                        script: "docker images ${env.IMAGE_NAME} --format '{{.Tag}}' | grep -x '${nextTag}' || true",
-                        returnStdout: true
-                    ).trim()
-
-                    if (tagExists) {
-                        echo "WARNING: Tag ${env.FULL_IMAGE} already exists locally from a previous failed build."
-                        echo "Removing stale image before rebuilding..."
-                        sh "docker rmi ${env.FULL_IMAGE} || true"
-                        echo "Stale image removed. Will build fresh."
-                    } else {
-                        echo "Tag ${env.FULL_IMAGE} is clean — no collision detected."
-                    }
                 }
             }
         }
 
         // ─────────────────────────────────────────────
-        // 4. Copy CApps to Docker build context
+        // 4. Copy changed/new .car files to Docker build context
         // ─────────────────────────────────────────────
         stage('Copy CApps to Docker Context') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -152,6 +130,7 @@ pipeline {
                 echo "=== Clearing old .car files from capps/ ==="
                 rm -f ${CAPP_DEST_DIR}/*.car
 
+                echo "=== Copying ALL .car files from HelloWorld/ ==="
                 mkdir -p ${CAPP_DEST_DIR}
 
                 find HelloWorld -name "*.car" -type f | while read CAR; do
@@ -174,6 +153,7 @@ pipeline {
             steps {
                 sh '''
                 echo "=== Building Docker image: ${FULL_IMAGE} ==="
+                echo "=== CApps baked in ==="
                 ls -lh ${CAPP_DEST_DIR}/
 
                 cd ${DOCKER_PROJECT_PATH}
@@ -205,13 +185,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 7. Update values-dev.yaml
-        //    Done AFTER successful docker build + kind
-        //    load. If build fails before this stage,
-        //    values-dev.yaml still holds the last good
-        //    tag. Next run resolves the same next tag,
-        //    detects and removes the stale image, and
-        //    rebuilds cleanly.
+        // 7. Update values-dev.yaml with new tag
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -307,6 +281,9 @@ pipeline {
         }
     }
 
+    // ─────────────────────────────────────────────
+    // Post actions
+    // ─────────────────────────────────────────────
     post {
         success {
             script {
@@ -340,10 +317,6 @@ pipeline {
 
             echo "=== Helm status ==="
             helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE} || true
-
-            echo "=== NOTE: values-dev.yaml only updated after successful build ==="
-            echo "=== If build failed before that stage, tag is still last good tag ==="
-            grep "tag:" ${VALUES_FILE} || true
             '''
         }
         cleanup {
