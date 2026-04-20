@@ -7,8 +7,6 @@ pipeline {
         CAPP_DEST_DIR         = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Cert folders in repo ---
-        // Drop new certs into certificates/ in GitHub
-        // After deploy → moved to certificates/deployed/ (same filename, different folder)
         CERT_INCOMING_DIR     = "certificates"
         CERT_DEPLOYED_DIR     = "certificates/deployed"
 
@@ -67,7 +65,7 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 2. Certificate check — alias-based detection
-        //    Scans certificates/ folder (NOT repo root)
+        //    Scans certificates/ folder only.
         //    Runs ONCE. Sets CERT_FOUND flag.
         // ─────────────────────────────────────────────
         stage('Certificate Check') {
@@ -139,12 +137,17 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 4. Backup existing truststore
+        //
+        //    Runs BEFORE any change to the truststore.
+        //    Saves a timestamped copy of the current
+        //    client-truststore.jks so you can always
+        //    rollback to the exact state before this run.
         // ─────────────────────────────────────────────
         stage('Backup Truststore') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Backing up existing truststore before update ==="
+                echo "=== Backing up existing truststore BEFORE any changes ==="
                 mkdir -p ${TRUSTSTORE_BACKUP_DIR}
 
                 TRUSTSTORE_PATH="${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
@@ -153,28 +156,46 @@ pipeline {
                 if [ -f "$TRUSTSTORE_PATH" ]; then
                     cp "$TRUSTSTORE_PATH" "$BACKUP_FILE"
                     echo "Backup saved: $BACKUP_FILE"
+                    echo "=== All backups (newest first) ==="
                     ls -lht ${TRUSTSTORE_BACKUP_DIR}/ | head -10
                 else
-                    echo "No existing truststore — skipping backup."
+                    echo "No existing truststore found — nothing to back up (first run)."
                 fi
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 5. Import certificates from certificates/ folder
+        // 5. Import ONLY NEW certificates
+        //
+        //    KEY CHANGE from previous version:
+        //    We do NOT re-import existing certs.
+        //    The existing truststore.jks is kept as-is
+        //    and only new aliases are added to it.
+        //
+        //    Logic per cert file:
+        //    - Derive alias from filename
+        //    - Check if alias already in truststore
+        //    - If YES  → skip (already there, no change)
+        //    - If NO   → import into existing truststore
+        //
+        //    This means:
+        //    - truststore.jks grows incrementally
+        //    - existing certs are never touched
+        //    - only genuinely new aliases are added
         // ─────────────────────────────────────────────
-        stage('Import Certificates') {
+        stage('Import New Certificates Only') {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Starting certificate import from ${CERT_INCOMING_DIR}/ ==="
+                echo "=== Importing ONLY NEW certificates into existing truststore ==="
                 chmod +x scripts/import-cert.sh
 
                 TRUSTSTORE_PATH="${DOCKER_PROJECT_PATH}/${TRUSTSTORE}"
 
+                # Create truststore only if it does not exist yet (first run)
                 if [ ! -f "$TRUSTSTORE_PATH" ]; then
-                    echo "Truststore not found — creating a fresh one..."
+                    echo "Truststore not found — creating a fresh empty one..."
                     keytool -genkeypair \
                         -alias temp \
                         -keystore "$TRUSTSTORE_PATH" \
@@ -189,14 +210,33 @@ pipeline {
                     echo "Empty truststore created."
                 fi
 
-                # Import only from certificates/ root — never from deployed/ subfolder
+                echo "--- Checking each cert against existing truststore ---"
+                IMPORTED=0
+                SKIPPED=0
+
                 find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     ALIAS=$(basename "$CERT" | cut -d. -f1)
-                    echo "--- Importing: $CERT  →  alias: $ALIAS ---"
-                    ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE_PATH" "${TRUSTSTORE_PASS}" "$ALIAS"
+
+                    # Check if alias already exists in truststore
+                    EXISTS=$(keytool -list \
+                        -keystore "$TRUSTSTORE_PATH" \
+                        -storepass ${TRUSTSTORE_PASS} \
+                        2>/dev/null | grep -ic "^${ALIAS},")
+
+                    if [ "$EXISTS" -gt 0 ]; then
+                        echo "SKIP   : $CERT  (alias '$ALIAS' already in truststore — not re-importing)"
+                    else
+                        echo "IMPORT : $CERT  (alias '$ALIAS' is new — adding to truststore)"
+                        ./scripts/import-cert.sh "$CERT" "$TRUSTSTORE_PATH" "${TRUSTSTORE_PASS}" "$ALIAS"
+                    fi
                 done
 
-                echo "=== All certificates imported successfully ==="
+                echo ""
+                echo "=== Import complete — truststore entry count ==="
+                keytool -list \
+                    -keystore "$TRUSTSTORE_PATH" \
+                    -storepass ${TRUSTSTORE_PASS} \
+                    | grep "Your keystore contains"
                 '''
             }
         }
@@ -208,7 +248,7 @@ pipeline {
             when { environment name: 'CERT_FOUND', value: 'true' }
             steps {
                 sh '''
-                echo "=== Truststore contents after import ==="
+                echo "=== Full truststore contents after import ==="
                 keytool -list \
                     -keystore "${DOCKER_PROJECT_PATH}/${TRUSTSTORE}" \
                     -storepass ${TRUSTSTORE_PASS}
@@ -384,16 +424,10 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 14. Archive Certificates
-        //
-        //     Moves certs: certificates/ → certificates/deployed/
-        //     SAME filename, just different folder.
-        //     git mv + push so next checkout finds certificates/
-        //     empty → pipeline skips cleanly next run.
-        //
-        //     Uses catchError so if git push fails (e.g. key
-        //     permission issue), the deployment is still marked
-        //     SUCCESS — certs are deployed, only archiving failed.
-        //     A warning is printed with the fix instructions.
+        //     git mv certificates/*.crt → certificates/deployed/
+        //     Same filename, different folder.
+        //     catchError: if git push fails (deploy key
+        //     needs write access), build still SUCCESS.
         // ─────────────────────────────────────────────
         stage('Archive Certificates') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -401,8 +435,6 @@ pipeline {
                 catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                     sh '''
                     echo "=== Archiving deployed certificates to ${CERT_DEPLOYED_DIR}/ ==="
-                    echo "=== (Same filename kept — only folder changes) ==="
-
                     mkdir -p ${CERT_DEPLOYED_DIR}
 
                     CERT_COUNT=$(find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | wc -l)
@@ -416,29 +448,23 @@ pipeline {
                     git config user.email "jenkins@wso2-mi-cicd"
                     git config user.name "Jenkins CI"
 
-                    # Move each cert: certificates/name.crt → certificates/deployed/name.crt
-                    # Filename stays EXACTLY the same — only the folder changes
                     find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                         FILENAME=$(basename "$CERT")
                         echo "  Moving: ${CERT_INCOMING_DIR}/$FILENAME → ${CERT_DEPLOYED_DIR}/$FILENAME"
                         git mv "${CERT_INCOMING_DIR}/$FILENAME" "${CERT_DEPLOYED_DIR}/$FILENAME"
                     done
 
-                    echo "=== Git status before commit ==="
-                    git status
-
                     git commit -m "[Jenkins] Archive deployed certificates — Build #${BUILD_NUMBER}
 
 Certificates moved: certificates/ → certificates/deployed/
-Same filenames kept — only folder changed.
+Same filenames — only folder changed.
 Image deployed: ${FULL_IMAGE}
 Namespace: ${K8S_NAMESPACE}
 Build: #${BUILD_NUMBER}"
 
                     git push origin main
 
-                    echo "=== Certificates archived to ${CERT_DEPLOYED_DIR}/ and pushed to GitHub ==="
-                    echo "=== Next pipeline run: certificates/ is empty → will skip cleanly ==="
+                    echo "=== Archived and pushed. Next run: certificates/ empty → pipeline skips ==="
                     ls -lh ${CERT_DEPLOYED_DIR}/
                     '''
                 }
@@ -461,10 +487,9 @@ Build: #${BUILD_NUMBER}"
 ║  Build       : #${BUILD_NUMBER}
 ╠══════════════════════════════════════════════════════╣
 ║  If Archive stage shows UNSTABLE:                    ║
-║  → Deployment succeeded but git push failed          ║
-║  → Fix: GitHub repo → Settings → Deploy keys        ║
+║  → Deployment succeeded, only git push failed        ║
+║  → Fix: GitHub → repo Settings → Deploy keys        ║
 ║         → tick Allow write access → Save             ║
-║  → Then re-run pipeline OR manually move certs       ║
 ╠══════════════════════════════════════════════════════╣
 ║  ROLLBACK STEPS:                                     ║
 ║  -- Image rollback --                                ║
@@ -475,7 +500,8 @@ Build: #${BUILD_NUMBER}"
 ║        -n ${K8S_NAMESPACE}
 ║  -- Truststore rollback --                           ║
 ║  1. ls -lht ${TRUSTSTORE_BACKUP_DIR}/
-║  2. kubectl delete configmap ${CONFIGMAP_NAME} -n ${K8S_NAMESPACE}
+║  2. kubectl delete configmap ${CONFIGMAP_NAME} \\
+║        -n ${K8S_NAMESPACE}
 ║  3. kubectl create configmap ${CONFIGMAP_NAME} \\
 ║        --from-file=<backup.jks> -n ${K8S_NAMESPACE}
 ║  4. kubectl rollout restart deployment/mi-deployment \\
@@ -483,7 +509,7 @@ Build: #${BUILD_NUMBER}"
 ╚══════════════════════════════════════════════════════╝
                     """
                 } else {
-                    echo "Pipeline completed — no new certificates in certificates/ folder, all stages skipped cleanly."
+                    echo "Pipeline completed — no new certificates detected, all stages skipped cleanly."
                 }
             }
         }
