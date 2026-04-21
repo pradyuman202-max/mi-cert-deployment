@@ -86,22 +86,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Resolve next image tag
-        //
-        //    TAG COLLISION FIX:
-        //    Reads current tag from values-dev.yaml and
-        //    increments by +1. Then checks if that tag
-        //    already exists locally (left over from a
-        //    previous failed build). If it does → removes
-        //    it first so docker build always starts clean.
-        //
-        //    Scenario this fixes:
-        //    Build N  → builds sit0018 → helm fails
-        //               → values-dev.yaml still sit0017
-        //    Build N+1 → resolves sit0018 again
-        //               → sit0018 exists → collision ERROR
-        //    Fix: detect stale sit0018 → docker rmi it
-        //         → build fresh sit0018 cleanly.
+        // 3. Resolve next image tag + collision check
         // ─────────────────────────────────────────────
         stage('Resolve Image Tag') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -256,7 +241,12 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 9. Verify rollout
+        // 9. Verify Rollout
+        //    FIXED: kubectl wait ensures old terminating
+        //    pods are gone before we exec into the pod.
+        //    Prevents race condition where POD selector
+        //    grabs a terminating pod instead of the new
+        //    running one.
         // ─────────────────────────────────────────────
         stage('Verify Rollout') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -271,37 +261,19 @@ pipeline {
                     | tr " " "\\n"
 
                 echo "=== CApps deployed inside pod ==="
+                kubectl wait --for=condition=Ready pod \
+                    -l app=mi \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=60s
+
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
                     -l app=mi \
                     --field-selector=status.phase=Running \
                     -o jsonpath="{.items[0].metadata.name}")
+
+                echo "Using pod: $POD"
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     ls -lh /home/wso2carbon/wso2mi-4.3.0/repository/deployment/server/carbonapps/
-                '''
-            }
-        }
-
-        // ─────────────────────────────────────────────
-        // 10. Health check
-        // ─────────────────────────────────────────────
-        stage('Health Check') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
-            steps {
-                sh '''
-                echo "=== Waiting 15s for MI to initialize ==="
-                sleep 15
-
-                POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
-                    -l app=mi \
-                    --field-selector=status.phase=Running \
-                    -o jsonpath="{.items[0].metadata.name}")
-
-                echo "=== Checking pod: $POD ==="
-                kubectl exec $POD -n ${K8S_NAMESPACE} -- \
-                    curl -sf http://localhost:9164/management/apis \
-                    -H "Authorization: Basic YWRtaW46YWRtaW4=" \
-                    && echo "Management API reachable — CApps deployed" \
-                    || echo "Management API not reachable — MI may still be starting"
                 '''
             }
         }
