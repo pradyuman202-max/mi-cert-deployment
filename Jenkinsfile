@@ -416,7 +416,7 @@ pipeline {
 
                 find ${CERT_INCOMING_DIR} -maxdepth 1 -type f \\( -name "*.crt" -o -name "*.cer" \\) | while read CERT; do
                     FILENAME=$(basename "$CERT")
-                    cp "$CERT" "${SERVER_CERT_DEPLOYED_DIR}/${FILENAME}"
+                    mv "$CERT" "${SERVER_CERT_DEPLOYED_DIR}/${FILENAME}"
                     echo "  Copied: $FILENAME → ${SERVER_CERT_DEPLOYED_DIR}/"
                 done
 
