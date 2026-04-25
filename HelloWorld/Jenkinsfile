@@ -261,9 +261,10 @@ pipeline {
                     --timeout=60s
 
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
-                    -l app=mi \
-                    --field-selector=status.phase=Running \
-                    -o jsonpath="{.items[0].metadata.name}")
+    -l app=mi \
+    --field-selector=status.phase=Running \
+    -o jsonpath="{range .items[?(!@.metadata.deletionTimestamp)]}{.metadata.name}{'\\n'}{end}" \
+    | head -1)
 
                 echo "Using pod: $POD"
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
