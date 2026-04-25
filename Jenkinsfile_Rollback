@@ -110,16 +110,8 @@ pipeline {
                     ).trim()
 
                     if (!localExists) {
-                        error """
-Image ${env.STABLE_IMAGE} not found in local Docker.
-It may have been pruned. Cannot rollback.
-
-Available images:
-$(docker images ${IMAGE_NAME} --format '{{.Repository}}:{{.Tag}}' | grep ':sit' | sort)
-
-Manual option: push a known good image to Kind manually,
-then update values-dev.yaml and run helm upgrade.
-                        """
+                        sh "echo '=== Available images ==='; docker images ${IMAGE_NAME} --format '{{.Repository}}:{{.Tag}}' | grep ':sit' | sort"
+                        error "Image ${env.STABLE_IMAGE} not found in local Docker. It may have been pruned. Cannot rollback. See available images above."
                     }
 
                     echo "✅ Image confirmed locally: ${env.STABLE_IMAGE}"
