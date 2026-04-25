@@ -1,0 +1,260 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// MI-Rollback Pipeline
+//
+// PURPOSE:
+//   Automatically triggered by CApp pipeline on failure.
+//   Can also be run manually from Jenkins "Build Now" at any time.
+//
+// HOW IT WORKS:
+//   1. Reads last-stable.txt — contains last confirmed working tag
+//   2. Verifies image exists locally and in Kind cluster
+//   3. Updates values-dev.yaml to the stable tag
+//   4. Helm deploys the stable image
+//   5. Verifies pod comes up healthy
+//
+// TRIGGERED BY:
+//   - Automatically: CApp pipeline post { failure } block
+//   - Manually: Jenkins "Build Now" on this job
+//
+// last-stable.txt format:
+//   sit0024|2026-04-21 18:24:05|build-24
+// ─────────────────────────────────────────────────────────────────────────────
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'TRIGGERED_BY',
+            defaultValue: 'Manual trigger',
+            description: 'Who triggered this rollback — auto-filled by CApp pipeline on failure'
+        )
+    }
+
+    environment {
+        DOCKER_PROJECT_PATH = "/home/svc_account_wso2/SIT_MI_Docker_Project"
+        IMAGE_NAME          = "mi-sit"
+        KIND_CLUSTER        = "wso2-cluster"
+        K8S_NAMESPACE       = "mi"
+        HELM_RELEASE        = "mi"
+        HELM_CHART_PATH     = "${DOCKER_PROJECT_PATH}/helm"
+        VALUES_FILE         = "${DOCKER_PROJECT_PATH}/values-dev.yaml"
+        LAST_STABLE_FILE    = "${DOCKER_PROJECT_PATH}/last-stable.txt"
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────
+        // 1. Read last-stable.txt
+        //    Parse tag, timestamp, build number.
+        //    Fail early if file missing.
+        // ─────────────────────────────────────────────
+        stage('Read Last Stable Image') {
+            steps {
+                script {
+                    echo "=== Rollback triggered by: ${params.TRIGGERED_BY} ==="
+
+                    def stableFile = sh(
+                        script: "cat ${LAST_STABLE_FILE} 2>/dev/null || echo ''",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!stableFile) {
+                        error """
+╔══════════════════════════════════════════════════════╗
+║         ROLLBACK FAILED — No stable image            ║
+╠══════════════════════════════════════════════════════╣
+║  last-stable.txt not found on server.                ║
+║  No successful deployment has been recorded yet.     ║
+║  Run a successful CApp deployment first.             ║
+╚══════════════════════════════════════════════════════╝
+                        """
+                    }
+
+                    // Parse: sit0024|2026-04-21 18:24:05|build-24
+                    def parts         = stableFile.split('\\|')
+                    env.STABLE_TAG       = parts[0].trim()
+                    env.STABLE_TIMESTAMP = parts.length > 1 ? parts[1].trim() : "unknown"
+                    env.STABLE_BUILD     = parts.length > 2 ? parts[2].trim() : "unknown"
+                    env.STABLE_IMAGE     = "${env.IMAGE_NAME}:${env.STABLE_TAG}"
+
+                    currentBuild.description = "Rollback → ${env.STABLE_IMAGE}"
+
+                    echo """
+╔══════════════════════════════════════════════════════╗
+║           Rolling Back To Last Stable Image          ║
+╠══════════════════════════════════════════════════════╣
+║  Tag            : ${env.STABLE_TAG}
+║  Deployed on    : ${env.STABLE_TIMESTAMP}
+║  From build     : ${env.STABLE_BUILD}
+║  Triggered by   : ${params.TRIGGERED_BY}
+╚══════════════════════════════════════════════════════╝
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 2. Verify stable image exists
+        //    Check locally and in Kind.
+        //    Reload into Kind if missing there.
+        // ─────────────────────────────────────────────
+        stage('Verify Stable Image Available') {
+            steps {
+                script {
+                    echo "=== Checking if ${env.STABLE_IMAGE} exists locally ==="
+
+                    def localExists = sh(
+                        script: "docker images ${IMAGE_NAME} --format '{{.Tag}}' | grep -x '${env.STABLE_TAG}' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!localExists) {
+                        error """
+Image ${env.STABLE_IMAGE} not found in local Docker.
+It may have been pruned. Cannot rollback.
+
+Available images:
+$(docker images ${IMAGE_NAME} --format '{{.Repository}}:{{.Tag}}' | grep ':sit' | sort)
+
+Manual option: push a known good image to Kind manually,
+then update values-dev.yaml and run helm upgrade.
+                        """
+                    }
+
+                    echo "✅ Image confirmed locally: ${env.STABLE_IMAGE}"
+
+                    // Check Kind — reload if not there
+                    def kindExists = sh(
+                        script: "docker exec ${KIND_CLUSTER}-control-plane crictl images 2>/dev/null | grep ${env.STABLE_TAG} || true",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!kindExists) {
+                        echo "Image not in Kind — reloading now..."
+                        sh "kind load docker-image ${env.STABLE_IMAGE} --name ${KIND_CLUSTER}"
+                        echo "✅ Reloaded into Kind"
+                    } else {
+                        echo "✅ Image already present in Kind cluster"
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 3. Update values-dev.yaml to stable tag
+        // ─────────────────────────────────────────────
+        stage('Update values-dev.yaml') {
+            steps {
+                sh '''
+                CURRENT=$(grep "tag:" ${VALUES_FILE} | sed "s/.*tag: *//" | tr -d " ")
+                echo "Current tag  : $CURRENT"
+                echo "Rollback to  : ${STABLE_TAG}"
+
+                sed -i "s|repository:.*|repository: ${IMAGE_NAME}|"  ${VALUES_FILE}
+                sed -i "s|tag:.*|tag: ${STABLE_TAG}|"               ${VALUES_FILE}
+                sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|"   ${VALUES_FILE}
+
+                echo "=== values-dev.yaml after update ==="
+                grep -A 3 "^image:" ${VALUES_FILE}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 4. Helm deploy stable image
+        // ─────────────────────────────────────────────
+        stage('Helm Rollback Deploy') {
+            steps {
+                sh '''
+                echo "=== Deploying stable image: ${STABLE_IMAGE} ==="
+                helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_PATH} \
+                    -f ${VALUES_FILE} \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout 3m0s
+
+                echo "=== Forcing pod restart ==="
+                kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}
+
+                echo "=== Waiting for rollout ==="
+                kubectl rollout status deployment/mi-deployment \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=120s
+
+                helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE}
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // 5. Verify rollback successful
+        // ─────────────────────────────────────────────
+        stage('Verify Rollback') {
+            steps {
+                sh '''
+                echo "=== Pod status after rollback ==="
+                kubectl get pods -n ${K8S_NAMESPACE} -o wide
+
+                kubectl wait --for=condition=Ready pod \
+                    -l app=mi \
+                    -n ${K8S_NAMESPACE} \
+                    --timeout=60s
+
+                echo "=== Image running after rollback ==="
+                kubectl get pods -n ${K8S_NAMESPACE} \
+                    -o jsonpath="{.items[*].spec.containers[*].image}" \
+                    | tr " " "\\n"
+
+                POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
+                    -l app=mi \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath="{.items[0].metadata.name}")
+
+                echo "=== CApps running in pod: $POD ==="
+                kubectl exec $POD -n ${K8S_NAMESPACE} -- \
+                    ls -lh /home/wso2carbon/wso2mi-4.3.0/repository/deployment/server/carbonapps/
+
+                echo ""
+                echo "✅ Rollback complete — ${STABLE_IMAGE} is running"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo """
+╔══════════════════════════════════════════════════════╗
+║        ROLLBACK COMPLETED SUCCESSFULLY               ║
+╠══════════════════════════════════════════════════════╣
+║  Restored     : ${env.STABLE_IMAGE}
+║  Deployed on  : ${env.STABLE_TIMESTAMP}
+║  From build   : ${env.STABLE_BUILD}
+║  Triggered by : ${params.TRIGGERED_BY}
+║  Rollback #   : ${BUILD_NUMBER}
+╚══════════════════════════════════════════════════════╝
+            """
+        }
+
+        failure {
+            sh '''
+            echo "=== ROLLBACK FAILED — MANUAL INTERVENTION REQUIRED ==="
+            echo ""
+            echo "Manual rollback steps:"
+            echo "1. Check available images:"
+            echo "   docker images mi-sit --format '{{.Tag}}' | grep '^sit' | sort -t t -k2 -n"
+            echo ""
+            echo "2. Update values-dev.yaml:"
+            echo "   sed -i 's|tag:.*|tag: sit####|' ${VALUES_FILE}"
+            echo ""
+            echo "3. Redeploy:"
+            echo "   helm upgrade mi ${HELM_CHART_PATH} -f ${VALUES_FILE} -n ${K8S_NAMESPACE}"
+            echo "   kubectl rollout restart deployment/mi-deployment -n ${K8S_NAMESPACE}"
+            echo ""
+            kubectl get pods -n ${K8S_NAMESPACE} || true
+            kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -20 || true
+            '''
+        }
+    }
+}
+

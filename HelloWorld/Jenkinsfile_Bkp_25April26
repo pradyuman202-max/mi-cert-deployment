@@ -10,6 +10,7 @@ pipeline {
         CAPP_DEST_DIR       = "${DOCKER_PROJECT_PATH}/capps"
 
         // --- Docker ---
+        // IMAGE_TAG resolved dynamically in 'Resolve Image Tag' stage
         IMAGE_NAME          = "mi-sit"
 
         // --- Kind cluster ---
@@ -20,11 +21,6 @@ pipeline {
         HELM_RELEASE        = "mi"
         HELM_CHART_PATH     = "${DOCKER_PROJECT_PATH}/helm"
         VALUES_FILE         = "${DOCKER_PROJECT_PATH}/values-dev.yaml"
-
-        // --- Stable image tracking ---
-        // Written after every successful deployment.
-        // Read by MI-Rollback pipeline to restore last known good image.
-        LAST_STABLE_FILE    = "${DOCKER_PROJECT_PATH}/last-stable.txt"
     }
 
     stages {
@@ -57,15 +53,14 @@ pipeline {
 
                 echo "=== Current image tag in values-dev.yaml ==="
                 grep "tag:" ${VALUES_FILE} || echo "WARNING: could not read tag"
-
-                echo "=== Last stable image ==="
-                cat ${LAST_STABLE_FILE} 2>/dev/null || echo "No last-stable.txt found yet"
                 '''
             }
         }
 
         // ─────────────────────────────────────────────
-        // 2. CApp Change Check — gatekeeper
+        // 2. CApp change detection — runs ONCE
+        //    NEW file, UPDATED checksum, or DELETED file
+        //    Sets CAPP_CHANGED flag for all stages.
         // ─────────────────────────────────────────────
         stage('CApp Change Check') {
             steps {
@@ -91,7 +86,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 3. Resolve Image Tag + collision check
+        // 3. Resolve next image tag + collision check
         // ─────────────────────────────────────────────
         stage('Resolve Image Tag') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -114,15 +109,17 @@ pipeline {
                     echo "New image tag: ${env.FULL_IMAGE}"
                     currentBuild.description = "CApp deploy — ${env.FULL_IMAGE}"
 
-                    // Tag collision check
+                    // ── TAG COLLISION CHECK ──────────────────────────
                     def tagExists = sh(
                         script: "docker images ${env.IMAGE_NAME} --format '{{.Tag}}' | grep -x '${nextTag}' || true",
                         returnStdout: true
                     ).trim()
 
                     if (tagExists) {
-                        echo "WARNING: Tag ${env.FULL_IMAGE} exists from previous failed build — removing stale image."
+                        echo "WARNING: Tag ${env.FULL_IMAGE} already exists locally from a previous failed build."
+                        echo "Removing stale image before rebuilding..."
                         sh "docker rmi ${env.FULL_IMAGE} || true"
+                        echo "Stale image removed. Will build fresh."
                     } else {
                         echo "Tag ${env.FULL_IMAGE} is clean — no collision detected."
                     }
@@ -155,7 +152,7 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────
-        // 5. Docker Build
+        // 5. Docker build
         // ─────────────────────────────────────────────
         stage('Docker Build') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -194,7 +191,12 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 7. Update values-dev.yaml
-        //    Done AFTER successful build + kind load.
+        //    Done AFTER successful docker build + kind
+        //    load. If build fails before this stage,
+        //    values-dev.yaml still holds the last good
+        //    tag. Next run resolves the same next tag,
+        //    detects and removes the stale image, and
+        //    rebuilds cleanly.
         // ─────────────────────────────────────────────
         stage('Update values-dev.yaml') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -240,7 +242,11 @@ pipeline {
 
         // ─────────────────────────────────────────────
         // 9. Verify Rollout
-        //    kubectl wait fixes race condition.
+        //    FIXED: kubectl wait ensures old terminating
+        //    pods are gone before we exec into the pod.
+        //    Prevents race condition where POD selector
+        //    grabs a terminating pod instead of the new
+        //    running one.
         // ─────────────────────────────────────────────
         stage('Verify Rollout') {
             when { environment name: 'CAPP_CHANGED', value: 'true' }
@@ -271,34 +277,6 @@ pipeline {
                 '''
             }
         }
-
-        // ─────────────────────────────────────────────
-        // 10. Record Stable Image
-        //
-        //     Written ONLY after full successful deploy.
-        //     MI-Rollback pipeline reads this file to
-        //     restore the last confirmed working image.
-        //
-        //     Format: TAG|TIMESTAMP|BUILD_NUMBER
-        //     Example: sit0024|2026-04-21 18:24:05|build-24
-        // ─────────────────────────────────────────────
-        stage('Record Stable Image') {
-            when { environment name: 'CAPP_CHANGED', value: 'true' }
-            steps {
-                sh '''
-                echo "=== Recording successful deployment as last stable ==="
-
-                TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
-                RECORD="${IMAGE_TAG}|${TIMESTAMP}|build-${BUILD_NUMBER}"
-
-                echo "$RECORD" > ${LAST_STABLE_FILE}
-
-                echo "Recorded: $RECORD"
-                echo "=== last-stable.txt ==="
-                cat ${LAST_STABLE_FILE}
-                '''
-            }
-        }
     }
 
     post {
@@ -312,11 +290,8 @@ pipeline {
 ║  Image     : ${env.FULL_IMAGE}
 ║  Namespace : ${K8S_NAMESPACE}
 ║  Build     : #${BUILD_NUMBER}
-║  Stable    : Recorded in last-stable.txt
 ╠══════════════════════════════════════════════════════╣
-║  ROLLBACK STEPS (manual):                            ║
-║  1. Go to Jenkins → MI-Rollback → Build Now          ║
-║  OR                                                  ║
+║  ROLLBACK STEPS:                                     ║
 ║  1. sed -i "s|tag:.*|tag: sit####|" ${VALUES_FILE}
 ║  2. helm upgrade mi ${HELM_CHART_PATH} \\
 ║        -f ${VALUES_FILE} -n ${K8S_NAMESPACE}
@@ -329,33 +304,20 @@ pipeline {
                 }
             }
         }
-
         failure {
             sh '''
             echo "=== FAILURE DIAGNOSTICS ==="
             kubectl get pods -n ${K8S_NAMESPACE} || true
             kubectl describe pods -n ${K8S_NAMESPACE} -l app=mi | tail -40 || true
+
+            echo "=== Helm status ==="
             helm status ${HELM_RELEASE} -n ${K8S_NAMESPACE} || true
 
-            echo "=== Last stable image ==="
-            cat ${LAST_STABLE_FILE} || echo "No last-stable.txt found"
-
-            echo "=== Current tag in values-dev.yaml ==="
+            echo "=== NOTE: values-dev.yaml only updated after successful build ==="
+            echo "=== If build failed before that stage, tag is still last good tag ==="
             grep "tag:" ${VALUES_FILE} || true
             '''
-
-            script {
-                // Auto-trigger rollback pipeline
-                echo "=== Deployment failed — auto-triggering MI-Rollback pipeline ==="
-                build job: 'MI-Rollback',
-                      parameters: [
-                          string(name: 'TRIGGERED_BY',
-                                 value: "${env.JOB_NAME} #${env.BUILD_NUMBER} — auto rollback on failure")
-                      ],
-                      wait: false
-            }
         }
-
         cleanup {
             sh '''
             echo "=== Pruning old local images (keep last 3) ==="
