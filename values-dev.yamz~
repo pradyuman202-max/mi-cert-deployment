@@ -1,0 +1,11 @@
+replicaCount: 1
+ 
+image:
+  repository: mi-sit
+  tag: sit0026
+  pullPolicy: IfNotPresent
+ 
+service:
+  type: NodePort
+  port: 8290
+  nodePort: 30290
