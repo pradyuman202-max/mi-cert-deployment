@@ -198,10 +198,10 @@ pipeline {
                     | tr " " "\\n"
 
                 POD=$(kubectl get pods -n ${K8S_NAMESPACE} \
-	        -l app=mi \
-	        --field-selector=status.phase=Running \
-   	        -o jsonpath="{range .items[?(!@.metadata.deletionTimestamp)]}{.metadata.name}{'\\n'}{end}" \
- 	        | head -1)
+                    -l app=mi \
+                    --field-selector=status.phase=Running \
+                    --sort-by=.metadata.creationTimestamp \
+                    -o jsonpath="{.items[-1:].metadata.name}")
 
                 echo "=== CApps running in pod: $POD ==="
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
