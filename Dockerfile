@@ -1,4 +1,4 @@
-FROM wso2/wso2mi:4.8.0
+FROM wso2/wso2mi:4.3.0
 
 USER root
 
