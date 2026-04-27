@@ -2,7 +2,7 @@ replicaCount: 1
  
 image:
   repository: mi-sit
-  tag: sit0030
+  tag: sit0031
   pullPolicy: IfNotPresent
  
 service:
