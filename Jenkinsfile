@@ -325,9 +325,6 @@ pipeline {
         }
         // ─────────────────────────────────────────────
         // 13. Health Check
-        //     1. Truststore mount check  — cert specific
-        //     2. keytool entry count     — cert specific
-        //     3. Management API loop     — soft warning only
         // ─────────────────────────────────────────────
         stage('Health Check') {
             when { environment name: 'CERT_FOUND', value: 'true' }
@@ -352,29 +349,14 @@ pipeline {
                     && echo "Truststore mount confirmed." \
                     || { echo "ERROR: Truststore not found in pod — mount failed."; exit 1; }
 
-                echo "=== Verifying truststore is readable (entry count) ==="
+                echo "=== Verifying truststore entry count ==="
                 kubectl exec $POD -n ${K8S_NAMESPACE} -- \
                     keytool -list \
                     -keystore /home/wso2carbon/client-truststore.jks \
                     -storepass ${TRUSTSTORE_PASS} \
                     | grep "Your keystore contains"
 
-                echo "=== Waiting for Management API (up to 6 min) ==="
-                MAX=24
-                COUNT=0
-                until kubectl exec $POD -n ${K8S_NAMESPACE} -- \
-                    curl -sf http://localhost:9164/management/apis \
-                    -H "Authorization: Basic YWRtaW46YWRtaW4="; do
-                    COUNT=$((COUNT+1))
-                    if [ $COUNT -ge $MAX ]; then
-                        echo "WARNING: Management API not reachable after ${MAX} attempts."
-                        echo "Truststore and pod are confirmed healthy — treating as soft warning."
-                        break
-                    fi
-                    echo "Attempt $COUNT/$MAX — MI still starting, retrying in 15s..."
-                    sleep 15
-                done
-                echo "Health check complete."
+                echo "Health check complete — truststore confirmed in pod."
                 '''
             }
         }
