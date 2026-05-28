@@ -1,30 +1,27 @@
 #!/bin/bash
+
 # ─────────────────────────────────────────────────────────────────────────────
 # this_cert_check.sh
 #
-# Alias check for each .crt / .cer in certificates/ folder.
+# Simple alias check for each .crt / .cer in certificates/ folder.
 # For each cert:
 #   → derive alias from filename
 #   → check if alias exists in truststore
-#   → NEW      → write path to NEW_CERTS_FILE, set flag
-#   → EXISTING → skip
+#   → NEW  → pipeline proceeds
+#   → OLD  → skip this cert
 #
-# NEW_CERTS_FILE is read by the Import stage — eliminates the second
-# alias lookup that was previously duplicated there.
-#
-# If ANY new cert found → exit 0 → pipeline proceeds
+# If ANY new cert found → exit 0 → pipeline deploys
 # If ALL already imported OR no certs → exit 1 → pipeline skips
 #
-# Usage: this_cert_check.sh <truststore_path> <truststore_password> <new_certs_file>
+# Usage: this_cert_check.sh <truststore_path> <truststore_password>
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRUSTSTORE="$1"
 TRUSTSTORE_PASS="$2"
-NEW_CERTS_FILE="${3:-/tmp/new_certs.txt}"
 CERT_DIR="./certificates"
 
 if [ -z "$TRUSTSTORE" ] || [ -z "$TRUSTSTORE_PASS" ]; then
-    echo "Usage: $0 <truststore_path> <truststore_password> <new_certs_file>"
+    echo "Usage: $0 <truststore_path> <truststore_password>"
     exit 1
 fi
 
@@ -33,11 +30,7 @@ if [ ! -d "$CERT_DIR" ]; then
     exit 1
 fi
 
-# Clean output file from any previous run
-rm -f "$NEW_CERTS_FILE"
-
 echo "Scanning: $CERT_DIR"
-echo "New certs output file: $NEW_CERTS_FILE"
 echo ""
 
 CERT_FILES=$(find "$CERT_DIR" -maxdepth 1 -type f \( -name "*.crt" -o -name "*.cer" \))
@@ -51,10 +44,8 @@ echo "Found certificate(s):"
 echo "$CERT_FILES"
 echo ""
 
-# If truststore doesn't exist yet, every cert is new — write them all out
 if [ ! -f "$TRUSTSTORE" ]; then
     echo "Truststore not found — all certs treated as new."
-    echo "$CERT_FILES" > "$NEW_CERTS_FILE"
     exit 0
 fi
 
@@ -66,8 +57,10 @@ NEW_CERT_FOUND=0
 while IFS= read -r CERT; do
     ALIAS=$(basename "$CERT" | cut -d. -f1)
 
-    # wc -l always exits 0 and returns a clean integer.
-    # grep -ic exits code 1 when count=0 — avoided here.
+    # ── USE wc -l instead of grep -ic ────────────────────────────────────────
+    # grep -ic exits code 1 when count=0, AND still outputs "0" to stdout.
+    # With "|| echo 0", EXISTS becomes "0\n0" (two lines) → integer error.
+    # wc -l always exits code 0 and always outputs a clean integer.
     EXISTS=$(keytool -list \
         -keystore "$TRUSTSTORE" \
         -storepass "$TRUSTSTORE_PASS" \
@@ -75,20 +68,15 @@ while IFS= read -r CERT; do
 
     if [ "$EXISTS" -eq 0 ]; then
         echo "NEW     : $CERT  (alias: $ALIAS — not in truststore)"
-        echo "$CERT" >> "$NEW_CERTS_FILE"
         NEW_CERT_FOUND=1
     else
-        echo "EXISTING: $CERT  (alias: $ALIAS — already imported, skipping)"
+        echo "EXISTING: $CERT  (alias: $ALIAS — already imported)"
     fi
 done <<< "$CERT_FILES"
 
 echo "────────────────────────────────────────────────────────"
 
 if [ "$NEW_CERT_FOUND" -eq 1 ]; then
-    echo ""
-    echo "New cert list written to: $NEW_CERTS_FILE"
-    cat "$NEW_CERTS_FILE"
-    echo ""
     echo "Result: NEW certificate(s) detected — pipeline will proceed."
     exit 0
 else
