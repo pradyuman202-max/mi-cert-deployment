@@ -1,5 +1,5 @@
-FROM wso2/wso2mi:4.8.0
-
+FROM wso2/wso2mi:4.3.0
+#FROM registry.wso2.com/wso2-integrator/mi:4.1.0.178
 USER root
 
 WORKDIR /home/wso2carbon
